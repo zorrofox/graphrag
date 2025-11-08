@@ -31,6 +31,9 @@ class SpannerVectorStore(BaseVectorStore):
         super().__init__(
             vector_store_schema_config=vector_store_schema_config, **kwargs
         )
+        # Sanitize index_name for Spanner (replace hyphens with underscores)
+        self.index_name = self.index_name.replace("-", "_")
+
         self._project_id = kwargs.get("project_id")
         self._instance_id = kwargs.get("instance_id")
         self._database_id = kwargs.get("database_id")
@@ -220,3 +223,9 @@ class SpannerVectorStore(BaseVectorStore):
                 )
 
         return VectorStoreDocument(id=id, text=None, vector=None)
+
+    def close(self) -> None:
+        """Close the Spanner client."""
+        if hasattr(self, "_client") and self._client:
+            self._client.close()
+                

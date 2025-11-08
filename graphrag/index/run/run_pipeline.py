@@ -100,6 +100,11 @@ async def run_pipeline(
     ):
         yield table
 
+    # Explicitly close storage to prevent hangs
+    for resource in [input_storage, output_storage, cache]:
+        if hasattr(resource, "close"):
+            resource.close()
+
 
 async def _run_pipeline(
     pipeline: Pipeline,

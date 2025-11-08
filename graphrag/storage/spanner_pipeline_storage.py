@@ -24,14 +24,19 @@ logger = logging.getLogger(__name__)
 class SpannerPipelineStorage(PipelineStorage):
     """The Google Cloud Spanner implementation."""
 
+    def _sanitize_table_name(self, name: str) -> str:
+        """Sanitize table name to comply with Spanner naming rules."""
+        return name.replace(".", "_").replace("-", "_")
+
     def __init__(self, **kwargs: Any) -> None:
         project_id = kwargs.get("project_id")
         instance_id = kwargs.get("instance_id")
         database_id = kwargs.get("database_id")
         credentials = kwargs.get("credentials")
         
-        # Fix: Ensure table_prefix is an empty string if it's None (default value from config)
-        self._table_prefix = kwargs.get("table_prefix") or ""
+        # Fix: Ensure table_prefix is an empty string if it's None, AND sanitize it.
+        raw_prefix = kwargs.get("table_prefix") or ""
+        self._table_prefix = self._sanitize_table_name(raw_prefix)
         self._blob_table = f"{self._table_prefix}Blobs"
 
         if not all([project_id, instance_id, database_id]):
@@ -217,7 +222,8 @@ class SpannerPipelineStorage(PipelineStorage):
 
     async def set_table(self, name: str, table: pd.DataFrame) -> None:
         """Write a dataframe to a Spanner table, creating or altering it if necessary."""
-        table_name = f"{self._table_prefix}{name}"
+        sanitized_name = self._sanitize_table_name(name)
+        table_name = f"{self._table_prefix}{sanitized_name}"
         df = table.where(pd.notnull(table), None)
         columns = tuple(df.columns)
 
@@ -256,7 +262,8 @@ class SpannerPipelineStorage(PipelineStorage):
 
     async def load_table(self, name: str) -> pd.DataFrame:
         """Load a table from Spanner."""
-        table_name = f"{self._table_prefix}{name}"
+        sanitized_name = self._sanitize_table_name(name)
+        table_name = f"{self._table_prefix}{sanitized_name}"
         with self._database.snapshot() as snapshot:
             results = snapshot.execute_sql(f"SELECT * FROM {table_name}")
             rows = list(results)
@@ -280,7 +287,8 @@ class SpannerPipelineStorage(PipelineStorage):
 
     async def has_table(self, name: str) -> bool:
         """Check if a table exists."""
-        table_name = f"{self._table_prefix}{name}"
+        sanitized_name = self._sanitize_table_name(name)
+        table_name = f"{self._table_prefix}{sanitized_name}"
         try:
             with self._database.snapshot() as snapshot:
                 # Use a cheap query to check existence
@@ -443,3 +451,9 @@ class SpannerPipelineStorage(PipelineStorage):
                 num_loaded += 1
                 if max_count > 0 and num_loaded >= max_count:
                     break
+
+    def close(self) -> None:
+        """Close the Spanner client."""
+        if self._client:
+            self._client.close()
+                

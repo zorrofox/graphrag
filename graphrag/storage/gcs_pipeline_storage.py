@@ -239,3 +239,8 @@ class GCSPipelineStorage(PipelineStorage):
         if path.startswith(prefix):
             return path[len(prefix):]
         return path
+
+    def close(self) -> None:
+        """Close the GCS client."""
+        if self._client:
+            self._client.close()

@@ -63,3 +63,8 @@ class JsonPipelineCache(PipelineCache):
     def child(self, name: str) -> "JsonPipelineCache":
         """Child method definition."""
         return JsonPipelineCache(self._storage.child(name), encoding=self._encoding)
+
+    def close(self) -> None:
+        """Close the underlying storage if it has a close method."""
+        if hasattr(self._storage, "close"):
+            self._storage.close()

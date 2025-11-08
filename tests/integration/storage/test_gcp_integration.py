@@ -505,3 +505,37 @@ async def test_spanner_vector_store_auto_creation(spanner_config):
             op.result(timeout=300)
         except Exception as e:
             print(f"Warning: Failed to drop auto-created vector table {index_name}: {e}")
+
+@pytest.mark.asyncio
+async def test_gcs_cache_factory_integration(gcs_bucket):
+    """Test that CacheFactory can create GCS-based cache from config."""
+    if not gcs_bucket:
+        pytest.skip("GCS_BUCKET_NAME not set")
+
+    from graphrag.cache.factory import CacheFactory
+    from graphrag.config.enums import CacheType
+    from graphrag.cache.json_pipeline_cache import JsonPipelineCache
+
+    base_dir = f"integration-test-cache-{uuid4()}"
+    
+    # Use factory to create cache
+    cache = CacheFactory.create_cache(
+        CacheType.gcs,
+        {"bucket_name": gcs_bucket, "base_dir": base_dir}
+    )
+    
+    assert isinstance(cache, JsonPipelineCache)
+
+    key = "test-cache-item"
+    value = {"data": "test content"}
+    
+    try:
+        await cache.set(key, value)
+        assert await cache.has(key)
+        assert await cache.get(key) == value
+        
+        # Clean up using underlying storage
+        await cache._storage.delete(key)
+        
+    except Exception as e:
+        pytest.fail(f"GCS cache factory test failed: {e}")

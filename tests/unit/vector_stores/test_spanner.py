@@ -18,7 +18,7 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.project_id = "test-project"
         self.instance_id = "test-instance"
         self.database_id = "test-database"
-        self.index_name = "test-table"
+        self.index_name = "test_table"
         self.config = VectorStoreSchemaConfig(
             index_name=self.index_name,
             id_field="id",
@@ -45,6 +45,11 @@ class TestSpannerVectorStore(unittest.TestCase):
     def test_connect(self):
         self.mock_client.instance.assert_called_with(self.instance_id)
         self.mock_instance.database.assert_called_with(self.database_id)
+
+    def test_close(self):
+        """Test that close() calls the underlying client's close method."""
+        self.store.close()
+        self.mock_client.close.assert_called_once()
 
     def test_load_documents(self):
         docs = [
@@ -187,3 +192,22 @@ class TestSpannerVectorStore(unittest.TestCase):
 
         # Verify insert_or_update was called twice
         self.assertEqual(mock_batch.insert_or_update.call_count, 2)
+
+    def test_init_sanitizes_table_name(self):
+        # Test that hyphens in index_name are replaced with underscores
+        config = VectorStoreSchemaConfig(
+            index_name="table-with-hyphens",
+            id_field="id",
+            text_field="text",
+            vector_field="vector",
+            attributes_field="attributes",
+            vector_size=3,
+        )
+        with patch("google.cloud.spanner.Client"):
+            store = SpannerVectorStore(
+                vector_store_schema_config=config,
+                project_id=self.project_id,
+                instance_id=self.instance_id,
+                database_id=self.database_id,
+            )
+            self.assertEqual(store.index_name, "table_with_hyphens")

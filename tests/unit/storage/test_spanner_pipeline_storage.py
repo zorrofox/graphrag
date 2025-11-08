@@ -41,15 +41,39 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(storage._table_prefix, "")
         self.assertEqual(storage._blob_table, "Blobs")
 
+    def test_init_sanitizes_table_prefix(self):
+        """Test that table_prefix is sanitized during initialization."""
+        with patch("google.cloud.spanner.Client", return_value=self.mock_client):
+            storage = SpannerPipelineStorage(
+                project_id=self.project_id,
+                instance_id=self.instance_id,
+                database_id=self.database_id,
+                table_prefix="my-app."
+            )
+        self.assertEqual(storage._table_prefix, "my_app_")
+        self.assertEqual(storage._blob_table, "my_app_Blobs")
+
     def test_init_missing_required_args(self):
         """Test that initialization fails if required arguments are missing."""
         with self.assertRaisesRegex(ValueError, "project_id, instance_id, and database_id are required"):
             SpannerPipelineStorage(project_id="p", instance_id="i")
 
+    def test_close(self):
+        """Test that close() calls the underlying client's close method."""
+        self.storage.close()
+        self.mock_client.close.assert_called_once()
+
     def test_init_empty_required_args(self):
         """Test that initialization fails if required arguments are empty strings."""
         with self.assertRaisesRegex(ValueError, "project_id, instance_id, and database_id are required"):
             SpannerPipelineStorage(project_id="", instance_id="i", database_id="d")
+
+    def test_sanitize_table_name(self):
+        """Test that table names are correctly sanitized."""
+        self.assertEqual(self.storage._sanitize_table_name("normal_table"), "normal_table")
+        self.assertEqual(self.storage._sanitize_table_name("table-with-hyphens"), "table_with_hyphens")
+        self.assertEqual(self.storage._sanitize_table_name("table.with.dots"), "table_with_dots")
+        self.assertEqual(self.storage._sanitize_table_name("mixed-table.name"), "mixed_table_name")
 
     async def test_set_table(self):
         df = pd.DataFrame({"col1": [1, 2], "col2": ["a", "b"]})
