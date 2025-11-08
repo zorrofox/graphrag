@@ -330,7 +330,36 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         # Verify DDL was called for Blobs table
         self.mock_database.update_ddl.assert_called_once()
         ddl = self.mock_database.update_ddl.call_args[0][0][0]
-        self.assertIn("CREATE TABLE `Blobs`", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS `Blobs`", ddl)
+
+        # Verify transaction was retried
+        self.assertEqual(call_count, 2)
+
+    async def test_set_blob_auto_create_invalid_argument(self):
+        """Test that set() automatically creates the Blobs table if it gets InvalidArgument (common for DML)."""
+        key = "test.txt"
+        value = b"hello"
+        
+        call_count = 0
+        def mock_run_in_transaction(func, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate the exact error from the logs
+                raise exceptions.InvalidArgument("400 Table not found: Blobs [at 1:18]")
+            return None
+
+        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
+        
+        mock_operation = MagicMock()
+        self.mock_database.update_ddl.return_value = mock_operation
+
+        await self.storage.set(key, value)
+
+        # Verify DDL was called for Blobs table
+        self.mock_database.update_ddl.assert_called_once()
+        ddl = self.mock_database.update_ddl.call_args[0][0][0]
+        self.assertIn("CREATE TABLE IF NOT EXISTS `Blobs`", ddl)
 
         # Verify transaction was retried
         self.assertEqual(call_count, 2)

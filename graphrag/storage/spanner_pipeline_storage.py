@@ -325,6 +325,17 @@ class SpannerPipelineStorage(PipelineStorage):
             logger.warning("Error getting key %s from Spanner", key)
             return None
 
+    def _ensure_blobs_table_exists(self) -> None:
+        """Ensure the Blobs table exists."""
+        logger.info("Ensuring Blob table %s exists.", self._blob_table)
+        ddl = f"""CREATE TABLE IF NOT EXISTS `{self._blob_table}` (
+            key STRING(MAX) NOT NULL,
+            value BYTES(MAX),
+            updated_at TIMESTAMP OPTIONS (allow_commit_timestamp=true),
+        ) PRIMARY KEY (key)"""
+        operation = self._database.update_ddl([ddl])
+        operation.result(timeout=600)
+
     async def set(self, key: str, value: Any, encoding: str | None = None) -> None:
         """Set a blob in Spanner."""
         if isinstance(value, str):
@@ -352,17 +363,12 @@ class SpannerPipelineStorage(PipelineStorage):
 
         try:
             self._database.run_in_transaction(_write_blob)
-        except exceptions.NotFound as e:
-             if "Table not found" in str(e) and self._blob_table in str(e):
-                 logger.info("Blob table %s not found, attempting to create it.", self._blob_table)
-                 # Create Blobs table specifically
-                 ddl = f"""CREATE TABLE `{self._blob_table}` (
-                        key STRING(MAX) NOT NULL,
-                        value BYTES(MAX),
-                        updated_at TIMESTAMP OPTIONS (allow_commit_timestamp=true),
-                    ) PRIMARY KEY (key)"""
-                 operation = self._database.update_ddl([ddl])
-                 operation.result(timeout=600)
+        except (exceptions.NotFound, exceptions.InvalidArgument) as e:
+             # Spanner DML returns InvalidArgument when table is missing,
+             # Mutation API returns NotFound. We catch both to be safe.
+             if "Table not found" in str(e):
+                 logger.info("Table not found error caught in set(): %s", e)
+                 self._ensure_blobs_table_exists()
                  # Retry write
                  self._database.run_in_transaction(_write_blob)
              else:
