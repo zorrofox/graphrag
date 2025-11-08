@@ -14,6 +14,7 @@ from graphrag.config.enums import CacheType
 from graphrag.storage.blob_pipeline_storage import BlobPipelineStorage
 from graphrag.storage.cosmosdb_pipeline_storage import CosmosDBPipelineStorage
 from graphrag.storage.file_pipeline_storage import FilePipelineStorage
+from graphrag.storage.gcs_pipeline_storage import GCSPipelineStorage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,9 +108,16 @@ def create_memory_cache(**kwargs) -> PipelineCache:
     return InMemoryCache(**kwargs)
 
 
+def create_gcs_cache(**kwargs) -> PipelineCache:
+    """Create a GCS-based cache implementation."""
+    storage = GCSPipelineStorage(**kwargs)
+    return JsonPipelineCache(storage)
+
+
 # --- register built-in cache implementations ---
 CacheFactory.register(CacheType.none.value, create_noop_cache)
 CacheFactory.register(CacheType.memory.value, create_memory_cache)
 CacheFactory.register(CacheType.file.value, create_file_cache)
 CacheFactory.register(CacheType.blob.value, create_blob_cache)
 CacheFactory.register(CacheType.cosmosdb.value, create_cosmosdb_cache)
+CacheFactory.register(CacheType.gcs.value, create_gcs_cache)

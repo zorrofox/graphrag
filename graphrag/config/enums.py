@@ -21,6 +21,8 @@ class CacheType(str, Enum):
     """The blob cache configuration type."""
     cosmosdb = "cosmosdb"
     """The cosmosdb cache configuration type"""
+    gcs = "gcs"
+    """The Google Cloud Storage cache configuration type."""
 
     def __repr__(self):
         """Get a string representation."""

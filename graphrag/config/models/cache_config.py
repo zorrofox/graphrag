@@ -36,3 +36,7 @@ class CacheConfig(BaseModel):
         description="The cosmosdb account url to use.",
         default=graphrag_config_defaults.cache.cosmosdb_account_url,
     )
+    bucket_name: str | None = Field(
+        description="The GCS bucket name to use.",
+        default=None,
+    )
