@@ -81,9 +81,13 @@ def create_communities(
 
     # aggregate relationships ids for each community
     # these are limited to only those where the source and target are in the same community
-    max_level = communities["level"].max()
+    if communities.empty:
+        max_level = -1
+    else:
+        max_level = communities["level"].max()
+        
     all_grouped = pd.DataFrame(
-        columns=["community", "level", "relationship_ids", "text_unit_ids"]  # type: ignore
+        columns=["community", "level", "parent", "relationship_ids", "text_unit_ids"]
     )
     for level in range(max_level + 1):
         communities_at_level = communities.loc[communities["level"] == level]
@@ -142,9 +146,12 @@ def create_communities(
         right_on="parent",
         how="left",
     )
+    if "children" not in final_communities.columns:
+        final_communities["children"] = np.empty((len(final_communities), 0)).tolist()
+
     # replace NaN children with empty list
     final_communities["children"] = final_communities["children"].apply(
-        lambda x: x if isinstance(x, np.ndarray) else []  # type: ignore
+        lambda x: x if isinstance(x, np.ndarray) or isinstance(x, list) else []
     )
     # add fields for incremental update tracking
     final_communities["period"] = datetime.now(timezone.utc).date().isoformat()

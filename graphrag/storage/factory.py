@@ -11,7 +11,9 @@ from graphrag.config.enums import StorageType
 from graphrag.storage.blob_pipeline_storage import BlobPipelineStorage
 from graphrag.storage.cosmosdb_pipeline_storage import CosmosDBPipelineStorage
 from graphrag.storage.file_pipeline_storage import FilePipelineStorage
+from graphrag.storage.gcs_pipeline_storage import GCSPipelineStorage
 from graphrag.storage.memory_pipeline_storage import MemoryPipelineStorage
+from graphrag.storage.spanner_pipeline_storage import SpannerPipelineStorage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -81,3 +83,5 @@ StorageFactory.register(StorageType.blob.value, BlobPipelineStorage)
 StorageFactory.register(StorageType.cosmosdb.value, CosmosDBPipelineStorage)
 StorageFactory.register(StorageType.file.value, FilePipelineStorage)
 StorageFactory.register(StorageType.memory.value, MemoryPipelineStorage)
+StorageFactory.register(StorageType.gcs.value, GCSPipelineStorage)
+StorageFactory.register(StorageType.spanner.value, SpannerPipelineStorage)

@@ -9,7 +9,10 @@ import pandas as pd
 
 def compute_degree(graph: nx.Graph) -> pd.DataFrame:
     """Create a new DataFrame with the degree of each node in the graph."""
-    return pd.DataFrame([
+    degrees = [
         {"title": node, "degree": int(degree)}
         for node, degree in graph.degree  # type: ignore
-    ])
+    ]
+    if not degrees:
+        return pd.DataFrame(columns=["title", "degree"])
+    return pd.DataFrame(degrees)

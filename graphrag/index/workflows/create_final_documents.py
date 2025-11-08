@@ -59,17 +59,20 @@ def create_final_documents(
 
     docs_with_text_units = joined.groupby("id", sort=False).agg(
         text_unit_ids=("chunk_id", list)
-    )
+    ).reset_index()
 
     rejoined = docs_with_text_units.merge(
         documents,
         on="id",
         how="right",
         copy=False,
-    ).reset_index(drop=True)
+    )
 
     rejoined["id"] = rejoined["id"].astype(str)
     rejoined["human_readable_id"] = rejoined.index
+
+    if "text_unit_ids" not in rejoined.columns:
+        rejoined["text_unit_ids"] = pd.Series(dtype="object")
 
     if "metadata" not in rejoined.columns:
         rejoined["metadata"] = pd.Series(dtype="object")

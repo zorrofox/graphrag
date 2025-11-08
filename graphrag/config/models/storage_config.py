@@ -50,3 +50,23 @@ class StorageConfig(BaseModel):
         description="The cosmosdb account url to use.",
         default=graphrag_config_defaults.storage.cosmosdb_account_url,
     )
+    bucket_name: str | None = Field(
+        description="The GCS bucket name to use.",
+        default=None,
+    )
+    project_id: str | None = Field(
+        description="The GCP project ID to use.",
+        default=None,
+    )
+    instance_id: str | None = Field(
+        description="The Spanner instance ID to use.",
+        default=None,
+    )
+    database_id: str | None = Field(
+        description="The Spanner database ID to use.",
+        default=None,
+    )
+    table_prefix: str | None = Field(
+        description="The table prefix to use for Spanner storage.",
+        default=None,
+    )

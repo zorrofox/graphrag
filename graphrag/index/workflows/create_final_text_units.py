@@ -5,6 +5,7 @@
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 from graphrag.config.models.graph_rag_config import GraphRagConfig
@@ -76,6 +77,14 @@ def create_final_text_units(
         final_joined["covariate_ids"] = [[] for i in range(len(final_joined))]
 
     aggregated = final_joined.groupby("id", sort=False).agg("first").reset_index()
+
+    # Ensure all required list columns exist and are filled with empty lists if missing/NaN
+    for col in ["entity_ids", "relationship_ids", "covariate_ids"]:
+        if col not in aggregated.columns:
+            aggregated[col] = np.empty((len(aggregated), 0)).tolist()
+        else:
+            # Fill NaNs that might have resulted from left joins with empty lists
+            aggregated[col] = aggregated[col].apply(lambda x: x if isinstance(x, (list, np.ndarray)) else [])
 
     return aggregated.loc[
         :,

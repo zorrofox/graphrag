@@ -67,6 +67,9 @@ dependencies = [
     "textblob>=0.18.0.post0",
     "spacy>=3.8.4",
     "litellm>=1.77.1",
+    # Google Cloud
+    "google-cloud-storage>=2.14.0",
+    "google-cloud-spanner>=3.40.0",
 ]
 
 [dependency-groups]

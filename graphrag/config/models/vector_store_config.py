@@ -87,6 +87,19 @@ class VectorStoreConfig(BaseModel):
         default=vector_store_defaults.overwrite,
     )
 
+    project_id: str | None = Field(
+        description="The GCP project ID for Spanner vector store.",
+        default=None,
+    )
+    instance_id: str | None = Field(
+        description="The Spanner instance ID for vector store.",
+        default=None,
+    )
+    database_id: str | None = Field(
+        description="The Spanner database ID for vector store.",
+        default=None,
+    )
+
     embeddings_schema: dict[str, VectorStoreSchemaConfig] = {}
 
     def _validate_embeddings_schema(self) -> None:

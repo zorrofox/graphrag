@@ -53,6 +53,10 @@ class StorageType(str, Enum):
     """The blob output type."""
     cosmosdb = "cosmosdb"
     """The cosmosdb output type"""
+    gcs = "gcs"
+    """The Google Cloud Storage output type."""
+    spanner = "spanner"
+    """The Google Cloud Spanner output type."""
 
     def __repr__(self):
         """Get a string representation."""
@@ -65,6 +69,7 @@ class VectorStoreType(str, Enum):
     LanceDB = "lancedb"
     AzureAISearch = "azure_ai_search"
     CosmosDB = "cosmosdb"
+    Spanner = "spanner"
 
 
 class ReportingType(str, Enum):

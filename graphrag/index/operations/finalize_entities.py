@@ -42,7 +42,20 @@ def finalize_entities(
     )
     final_entities = final_entities.loc[entities["title"].notna()].reset_index()
     # disconnected nodes and those with no community even at level 0 can be missing degree
+    if "degree" not in final_entities.columns:
+        final_entities["degree"] = 0
     final_entities["degree"] = final_entities["degree"].fillna(0).astype(int)
+
+    # Ensure x and y columns exist (from layout)
+    if "x" not in final_entities.columns:
+        final_entities["x"] = 0.0
+    if "y" not in final_entities.columns:
+        final_entities["y"] = 0.0
+
+    # Ensure frequency column exists (it should come from input entities, but might be missing)
+    if "frequency" not in final_entities.columns:
+        final_entities["frequency"] = 1
+
     final_entities.reset_index(inplace=True)
     final_entities["human_readable_id"] = final_entities.index
     final_entities["id"] = final_entities["human_readable_id"].apply(

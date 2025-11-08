@@ -32,6 +32,12 @@ def finalize_relationships(
         edge_target_column="target",
     )
 
+    if "combined_degree" not in final_relationships.columns:
+        final_relationships["combined_degree"] = 0
+    final_relationships["combined_degree"] = (
+        final_relationships["combined_degree"].fillna(0).astype(int)
+    )
+
     final_relationships.reset_index(inplace=True)
     final_relationships["human_readable_id"] = final_relationships.index
     final_relationships["id"] = final_relationships["human_readable_id"].apply(
