@@ -39,6 +39,8 @@ class SpannerPipelineStorage(PipelineStorage):
         self._table_prefix = self._sanitize_table_name(raw_prefix)
         self._blob_table = f"{self._table_prefix}Blobs"
 
+        logger.debug("Creating SpannerPipelineStorage: obj_id=%s, prefix=%s", id(self), self._table_prefix)
+
         if not all([project_id, instance_id, database_id]):
             msg = "project_id, instance_id, and database_id are required."
             raise ValueError(msg)
@@ -454,6 +456,7 @@ class SpannerPipelineStorage(PipelineStorage):
 
     def close(self) -> None:
         """Close the Spanner client."""
+        logger.debug("Closing SpannerPipelineStorage: obj_id=%s", id(self))
         if self._client:
             self._client.close()
                 

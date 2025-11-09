@@ -57,17 +57,21 @@ async def embed_text(
         vector_store_workflow_config = vector_store_config.get(
             embedding_name, vector_store_config
         )
-        return await _text_embed_with_vector_store(
-            input=input,
-            callbacks=callbacks,
-            cache=cache,
-            embed_column=embed_column,
-            strategy=strategy,
-            vector_store=vector_store,
-            vector_store_config=vector_store_workflow_config,
-            id_column=id_column,
-            title_column=title_column,
-        )
+        try:
+            return await _text_embed_with_vector_store(
+                input=input,
+                callbacks=callbacks,
+                cache=cache,
+                embed_column=embed_column,
+                strategy=strategy,
+                vector_store=vector_store,
+                vector_store_config=vector_store_workflow_config,
+                id_column=id_column,
+                title_column=title_column,
+            )
+        finally:
+            if hasattr(vector_store, "close"):
+                vector_store.close()
 
     return await _text_embed_in_memory(
         input=input,
