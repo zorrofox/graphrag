@@ -27,16 +27,12 @@ class TestSpannerVectorStore(unittest.TestCase):
             attributes_field="attributes",
             vector_size=3,
         )
-        self.mock_client = MagicMock()
-        self.mock_instance = MagicMock()
         self.mock_database = MagicMock()
-        self.mock_client.instance.return_value = self.mock_instance
-        self.mock_instance.database.return_value = self.mock_database
 
-        # Use patch for SpannerClientManager.get_client
-        self.client_manager_patcher = patch("graphrag.vector_stores.spanner.SpannerClientManager")
-        self.mock_client_manager = self.client_manager_patcher.start()
-        self.mock_client_manager.get_client.return_value = self.mock_client
+        # Use patch for SpannerResourceManager.get_database
+        self.resource_manager_patcher = patch("graphrag.vector_stores.spanner.SpannerResourceManager")
+        self.mock_resource_manager = self.resource_manager_patcher.start()
+        self.mock_resource_manager.get_database.return_value = self.mock_database
 
         self.store = SpannerVectorStore(
             vector_store_schema_config=self.config,
@@ -47,19 +43,21 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.store.connect()
 
     def tearDown(self):
-        self.client_manager_patcher.stop()
+        self.resource_manager_patcher.stop()
 
     def test_connect(self):
-        self.mock_client.instance.assert_called_with(self.instance_id)
-        self.mock_instance.database.assert_called_with(self.database_id)
+        self.mock_resource_manager.get_database.assert_called_with(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+            credentials=None
+        )
 
     def test_close(self):
-        """Test that close() calls SpannerClientManager.release_client."""
+        """Test that close() calls SpannerResourceManager.release_database."""
         self.store.close()
-        # Should NOT call client.close() directly anymore
-        self.mock_client.close.assert_not_called()
-        # Should call release_client instead
-        self.mock_client_manager.release_client.assert_called_once_with(self.mock_client)
+        self.mock_resource_manager.release_database.assert_called_once_with(self.mock_database)
+        self.assertIsNone(self.store._database)
 
     def test_load_documents(self):
         docs = [
@@ -213,12 +211,16 @@ class TestSpannerVectorStore(unittest.TestCase):
             attributes_field="attributes",
             vector_size=3,
         )
-        # We need to patch SpannerClientManager here too because it's used in __init__
-        with patch("graphrag.vector_stores.spanner.SpannerClientManager"):
-            store = SpannerVectorStore(
-                vector_store_schema_config=config,
-                project_id=self.project_id,
-                instance_id=self.instance_id,
-                database_id=self.database_id,
-            )
-            self.assertEqual(store.index_name, "table_with_hyphens")
+        # We need to patch SpannerResourceManager here too because it's used in __init__ (via super().__init__ -> connect if we were calling it, but we are not calling connect in __init__ anymore, wait, we are NOT calling connect in __init__ in base class, but we might be calling it manually in tests)
+        # Actually, SpannerVectorStore.__init__ does NOT call connect().
+        # But let's be safe and patch it if it might be called.
+        # In this test case, we don't call connect(), so it should be fine without patching if __init__ doesn't call it.
+        # Let's check BaseVectorStore.__init__... it doesn't call connect().
+        
+        store = SpannerVectorStore(
+            vector_store_schema_config=config,
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+        )
+        self.assertEqual(store.index_name, "table_with_hyphens")

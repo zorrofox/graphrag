@@ -13,7 +13,7 @@ from google.cloud.spanner_v1 import param_types
 
 from graphrag.config.models.vector_store_schema_config import VectorStoreSchemaConfig
 from graphrag.data_model.types import TextEmbedder
-from graphrag.utils.spanner_client_manager import SpannerClientManager
+from graphrag.utils.spanner_resource_manager import SpannerResourceManager
 from graphrag.vector_stores.base import (
     BaseVectorStore,
     VectorStoreDocument,
@@ -41,7 +41,7 @@ class SpannerVectorStore(BaseVectorStore):
         self._instance_id = kwargs.get("instance_id")
         self._database_id = kwargs.get("database_id")
         self._credentials = kwargs.get("credentials")
-        self._client = None
+        self._database = None
 
     def connect(self, **kwargs: Any) -> None:
         """Connect to the vector storage."""
@@ -54,14 +54,18 @@ class SpannerVectorStore(BaseVectorStore):
             msg = "project_id, instance_id, and database_id are required for Spanner connection."
             raise ValueError(msg)
 
-        # Use the shared client manager
+        # Use the shared resource manager
         # Ensure we don't leak a reference if connect is called multiple times
-        if self._client:
-             SpannerClientManager.release_client(self._client)
+        if self._database:
+             SpannerResourceManager.release_database(self._database)
              
-        self._client = SpannerClientManager.get_client(project_id=project_id, credentials=credentials)
-        self._instance = self._client.instance(instance_id)
-        self._database = self._instance.database(database_id)
+        self._database = SpannerResourceManager.get_database(
+            project_id=project_id,
+            instance_id=instance_id,
+            database_id=database_id,
+            credentials=credentials
+        )
+        # We don't need self._client or self._instance anymore, as they are managed internally by SpannerResourceManager
 
     def _create_table_if_not_exists(self) -> None:
         """Create the vector store table and index if they don't exist."""
@@ -234,8 +238,8 @@ class SpannerVectorStore(BaseVectorStore):
         return VectorStoreDocument(id=id, text=None, vector=None)
 
     def close(self) -> None:
-        """Release the Spanner client."""
-        if hasattr(self, "_client") and self._client:
-            logger.debug("Releasing SpannerVectorStore client: obj_id=%s", id(self))
-            SpannerClientManager.release_client(self._client)
-            self._client = None
+        """Release the Spanner database resource."""
+        if hasattr(self, "_database") and self._database:
+            logger.debug("Releasing SpannerVectorStore database: obj_id=%s", id(self))
+            SpannerResourceManager.release_database(self._database)
+            self._database = None

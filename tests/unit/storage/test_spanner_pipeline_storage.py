@@ -16,16 +16,12 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         self.project_id = "test-project"
         self.instance_id = "test-instance"
         self.database_id = "test-database"
-        self.mock_client = MagicMock()
-        self.mock_instance = MagicMock()
         self.mock_database = MagicMock()
-        self.mock_client.instance.return_value = self.mock_instance
-        self.mock_instance.database.return_value = self.mock_database
 
-        # Use patch for SpannerClientManager.get_client
-        self.client_manager_patcher = patch("graphrag.storage.spanner_pipeline_storage.SpannerClientManager")
-        self.mock_client_manager = self.client_manager_patcher.start()
-        self.mock_client_manager.get_client.return_value = self.mock_client
+        # Use patch for SpannerResourceManager.get_database
+        self.resource_manager_patcher = patch("graphrag.storage.spanner_pipeline_storage.SpannerResourceManager")
+        self.mock_resource_manager = self.resource_manager_patcher.start()
+        self.mock_resource_manager.get_database.return_value = self.mock_database
 
         self.storage = SpannerPipelineStorage(
             project_id=self.project_id,
@@ -34,7 +30,7 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         )
 
     def tearDown(self):
-        self.client_manager_patcher.stop()
+        self.resource_manager_patcher.stop()
 
     def test_init_with_none_table_prefix(self):
         """Test initialization when table_prefix is explicitly None."""
@@ -64,13 +60,10 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
             SpannerPipelineStorage(project_id="p", instance_id="i")
 
     def test_close(self):
-        """Test that close() calls SpannerClientManager.release_client."""
+        """Test that close() calls SpannerResourceManager.release_database."""
         self.storage.close()
-        # Should NOT call client.close() directly anymore
-        self.mock_client.close.assert_not_called()
-        # Should call release_client instead
-        self.mock_client_manager.release_client.assert_called_once_with(self.mock_client)
-        self.assertIsNone(self.storage._client)
+        self.mock_resource_manager.release_database.assert_called_once_with(self.mock_database)
+        self.assertIsNone(self.storage._database)
 
     def test_init_empty_required_args(self):
         """Test that initialization fails if required arguments are empty strings."""

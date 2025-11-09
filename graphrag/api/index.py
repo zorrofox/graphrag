@@ -9,6 +9,7 @@ Backwards compatibility is not guaranteed at this time.
 """
 
 import logging
+import asyncio
 from typing import Any
 
 import pandas as pd
@@ -92,7 +93,21 @@ async def build_index(
             logger.info("Workflow %s completed successfully", output.workflow)
         logger.debug(str(output.result))
 
+    logger.info("Pipeline processing complete, calling pipeline_end callbacks...")
     workflow_callbacks.pipeline_end(outputs)
+
+    # Gracefully shutdown litellm's background logging worker
+    try:
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+        logger.info("Stopping litellm LoggingWorker...")
+        # We use asyncio.create_task to run it if we are not in an async context, 
+        # but build_index IS async, so we can just await it.
+        # However, we need to be sure it doesn't hang indefinitely.
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.stop(), timeout=5.0)
+        logger.info("litellm LoggingWorker stopped.")
+    except Exception as e:
+        logger.warning("Error stopping litellm LoggingWorker: %s", e)
+
     return outputs
 
 
