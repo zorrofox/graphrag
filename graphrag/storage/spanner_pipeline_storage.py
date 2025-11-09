@@ -17,6 +17,7 @@ from google.api_core import exceptions
 from google.cloud import spanner
 
 from graphrag.storage.pipeline_storage import PipelineStorage
+from graphrag.utils.spanner_client_manager import SpannerClientManager
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ class SpannerPipelineStorage(PipelineStorage):
             msg = "project_id, instance_id, and database_id are required."
             raise ValueError(msg)
 
-        self._client = spanner.Client(project=project_id, credentials=credentials)
+        # Use the shared client manager
+        self._client = SpannerClientManager.get_client(project_id=project_id, credentials=credentials)
         self._instance = self._client.instance(instance_id)
         self._database = self._instance.database(database_id)
         self._schema_cache = {}
@@ -455,8 +457,8 @@ class SpannerPipelineStorage(PipelineStorage):
                     break
 
     def close(self) -> None:
-        """Close the Spanner client."""
-        logger.debug("Closing SpannerPipelineStorage: obj_id=%s", id(self))
-        if self._client:
-            self._client.close()
-                
+        """Release the Spanner client."""
+        if hasattr(self, "_client") and self._client:
+            logger.debug("Releasing SpannerPipelineStorage client: obj_id=%s", id(self))
+            SpannerClientManager.release_client(self._client)
+            self._client = None

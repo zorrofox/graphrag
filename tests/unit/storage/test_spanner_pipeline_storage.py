@@ -22,34 +22,39 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         self.mock_client.instance.return_value = self.mock_instance
         self.mock_instance.database.return_value = self.mock_database
 
-        with patch("google.cloud.spanner.Client", return_value=self.mock_client):
-            self.storage = SpannerPipelineStorage(
-                project_id=self.project_id,
-                instance_id=self.instance_id,
-                database_id=self.database_id,
-            )
+        # Use patch for SpannerClientManager.get_client
+        self.client_manager_patcher = patch("graphrag.storage.spanner_pipeline_storage.SpannerClientManager")
+        self.mock_client_manager = self.client_manager_patcher.start()
+        self.mock_client_manager.get_client.return_value = self.mock_client
+
+        self.storage = SpannerPipelineStorage(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+        )
+
+    def tearDown(self):
+        self.client_manager_patcher.stop()
 
     def test_init_with_none_table_prefix(self):
         """Test initialization when table_prefix is explicitly None."""
-        with patch("google.cloud.spanner.Client", return_value=self.mock_client):
-            storage = SpannerPipelineStorage(
-                project_id=self.project_id,
-                instance_id=self.instance_id,
-                database_id=self.database_id,
-                table_prefix=None
-            )
+        storage = SpannerPipelineStorage(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+            table_prefix=None
+        )
         self.assertEqual(storage._table_prefix, "")
         self.assertEqual(storage._blob_table, "Blobs")
 
     def test_init_sanitizes_table_prefix(self):
         """Test that table_prefix is sanitized during initialization."""
-        with patch("google.cloud.spanner.Client", return_value=self.mock_client):
-            storage = SpannerPipelineStorage(
-                project_id=self.project_id,
-                instance_id=self.instance_id,
-                database_id=self.database_id,
-                table_prefix="my-app."
-            )
+        storage = SpannerPipelineStorage(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+            table_prefix="my-app."
+        )
         self.assertEqual(storage._table_prefix, "my_app_")
         self.assertEqual(storage._blob_table, "my_app_Blobs")
 
@@ -59,9 +64,13 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
             SpannerPipelineStorage(project_id="p", instance_id="i")
 
     def test_close(self):
-        """Test that close() calls the underlying client's close method."""
+        """Test that close() calls SpannerClientManager.release_client."""
         self.storage.close()
-        self.mock_client.close.assert_called_once()
+        # Should NOT call client.close() directly anymore
+        self.mock_client.close.assert_not_called()
+        # Should call release_client instead
+        self.mock_client_manager.release_client.assert_called_once_with(self.mock_client)
+        self.assertIsNone(self.storage._client)
 
     def test_init_empty_required_args(self):
         """Test that initialization fails if required arguments are empty strings."""

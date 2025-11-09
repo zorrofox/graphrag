@@ -33,23 +33,33 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.mock_client.instance.return_value = self.mock_instance
         self.mock_instance.database.return_value = self.mock_database
 
-        with patch("google.cloud.spanner.Client", return_value=self.mock_client):
-            self.store = SpannerVectorStore(
-                vector_store_schema_config=self.config,
-                project_id=self.project_id,
-                instance_id=self.instance_id,
-                database_id=self.database_id,
-            )
-            self.store.connect()
+        # Use patch for SpannerClientManager.get_client
+        self.client_manager_patcher = patch("graphrag.vector_stores.spanner.SpannerClientManager")
+        self.mock_client_manager = self.client_manager_patcher.start()
+        self.mock_client_manager.get_client.return_value = self.mock_client
+
+        self.store = SpannerVectorStore(
+            vector_store_schema_config=self.config,
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+        )
+        self.store.connect()
+
+    def tearDown(self):
+        self.client_manager_patcher.stop()
 
     def test_connect(self):
         self.mock_client.instance.assert_called_with(self.instance_id)
         self.mock_instance.database.assert_called_with(self.database_id)
 
     def test_close(self):
-        """Test that close() calls the underlying client's close method."""
+        """Test that close() calls SpannerClientManager.release_client."""
         self.store.close()
-        self.mock_client.close.assert_called_once()
+        # Should NOT call client.close() directly anymore
+        self.mock_client.close.assert_not_called()
+        # Should call release_client instead
+        self.mock_client_manager.release_client.assert_called_once_with(self.mock_client)
 
     def test_load_documents(self):
         docs = [
@@ -203,7 +213,8 @@ class TestSpannerVectorStore(unittest.TestCase):
             attributes_field="attributes",
             vector_size=3,
         )
-        with patch("google.cloud.spanner.Client"):
+        # We need to patch SpannerClientManager here too because it's used in __init__
+        with patch("graphrag.vector_stores.spanner.SpannerClientManager"):
             store = SpannerVectorStore(
                 vector_store_schema_config=config,
                 project_id=self.project_id,

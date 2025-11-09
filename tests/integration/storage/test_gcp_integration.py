@@ -59,6 +59,10 @@ def setup_spanner_tables():
             vector ARRAY<FLOAT64>,
             attributes JSON
         ) PRIMARY KEY (id)""",
+        """CREATE VECTOR INDEX IF NOT EXISTS TestVectorTable_VectorIndex
+            ON TestVectorTable(vector)
+            WHERE vector IS NOT NULL
+            OPTIONS (distance_type = 'COSINE')""",
         """CREATE TABLE IF NOT EXISTS FactoryTest_Blobs (
             key STRING(MAX) NOT NULL,
             value BYTES(MAX),
@@ -68,7 +72,7 @@ def setup_spanner_tables():
 
     try:
         operation = database.update_ddl(ddl)
-        operation.result(timeout=300) # Wait for DDL to complete
+        operation.result(timeout=600) # Wait for DDL to complete
     except Exception as e:
         print(f"Warning: Failed to update DDL, tables might already exist or permissions missing: {e}")
 
@@ -119,6 +123,8 @@ async def test_spanner_storage_integration(spanner_config, setup_spanner_tables)
         assert not await storage.has(key)
     except Exception as e:
         pytest.fail(f"Spanner blob test failed: {e}")
+    finally:
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_vector_store_integration(spanner_config, setup_spanner_tables):
@@ -161,6 +167,8 @@ async def test_spanner_vector_store_integration(spanner_config, setup_spanner_ta
 
     except Exception as e:
         pytest.fail(f"Spanner vector store test failed: {e}")
+    finally:
+        store.close()
 
 @pytest.mark.asyncio
 async def test_spanner_table_storage_integration(spanner_config):
@@ -256,6 +264,7 @@ async def test_spanner_table_storage_integration(spanner_config):
             op.result(timeout=300)
         except Exception as e:
             print(f"Warning: Failed to drop table {table_name}: {e}")
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_auto_table_creation(spanner_config):
@@ -311,6 +320,7 @@ async def test_spanner_auto_table_creation(spanner_config):
             op.result(timeout=300)
         except Exception as e:
             print(f"Warning: Failed to drop auto-created table {table_name}: {e}")
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_schema_evolution(spanner_config):
@@ -364,6 +374,7 @@ async def test_spanner_schema_evolution(spanner_config):
             op.result(timeout=300)
         except Exception as e:
             print(f"Warning: Failed to drop schema evolution test table {table_name}: {e}")
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_storage_factory_integration(spanner_config, setup_spanner_tables):
@@ -404,6 +415,7 @@ async def test_spanner_storage_factory_integration(spanner_config, setup_spanner
             await storage.delete(key)
         except Exception:
             pass
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_load_empty_table_columns(spanner_config):
@@ -438,6 +450,7 @@ async def test_spanner_load_empty_table_columns(spanner_config):
             op.result(timeout=300)
         except Exception:
             pass
+        storage.close()
 
 @pytest.mark.asyncio
 async def test_spanner_vector_store_auto_creation(spanner_config):
@@ -505,6 +518,7 @@ async def test_spanner_vector_store_auto_creation(spanner_config):
             op.result(timeout=300)
         except Exception as e:
             print(f"Warning: Failed to drop auto-created vector table {index_name}: {e}")
+        store.close()
 
 @pytest.mark.asyncio
 async def test_gcs_cache_factory_integration(gcs_bucket):
