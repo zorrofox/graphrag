@@ -64,6 +64,72 @@ This fork extends GraphRAG with native Google Cloud Platform support. Key files 
 - `StorageConfig`: added `bucket_name`, `project_id`, `instance_id`, `database_id`, `table_prefix`
 - `VectorStoreConfig`: added `project_id`, `instance_id`, `database_id`
 
+## Testing
+
+### Unit tests
+
+```bash
+uv run poe test_unit                     # all unit tests
+uv run python -m pytest tests/unit/storage/test_gcs_pipeline_storage.py \
+                           tests/unit/storage/test_spanner_pipeline_storage.py \
+                           tests/unit/vector_stores/test_spanner.py \
+                           tests/unit/utils/test_spanner_resource_manager.py -v
+```
+
+All GCP unit tests use `unittest.mock` — no live credentials needed.
+
+| Test file | What it covers |
+|-----------|---------------|
+| `tests/unit/storage/test_gcs_pipeline_storage.py` | GCSPipelineStorage CRUD, child(), find(), keys(), clear(), async exception handling |
+| `tests/unit/storage/test_spanner_pipeline_storage.py` | SpannerPipelineStorage blob ops, set_table() auto-create/alter/retry, `TestInferSpannerType` (13 type-inference cases), `TestSafeIdentifier` (SQL injection guard) |
+| `tests/unit/vector_stores/test_spanner.py` | SpannerVectorStore load, search, filter, SQL identifier quoting, query_filter lifecycle |
+| `tests/unit/utils/test_spanner_resource_manager.py` | SpannerResourceManager client sharing, credentials-aware keying, reference counting |
+
+### Integration tests
+
+Require live GCP credentials. Set env vars before running:
+
+```bash
+export GRAPHRAG_GCP_INTEGRATION_TEST=1
+export GCS_BUCKET_NAME=<bucket>
+export GCP_PROJECT_ID=<project>
+export SPANNER_INSTANCE_ID=<instance>
+export SPANNER_DATABASE_ID=<database>
+
+uv run poe test_integration
+# or target only GCP tests:
+uv run python -m pytest tests/integration/storage/test_gcp_integration.py -v
+```
+
+**Spanner instance requirements:** Enterprise edition, `GOOGLE_STANDARD_SQL` dialect (needed for `ARRAY<FLOAT64>(vector_length=>N)` and vector indexes).
+
+```bash
+# Create a temporary test instance (us-central1, Enterprise, 100 PUs)
+gcloud spanner instances create <name> \
+  --project=<project> --config=regional-us-central1 \
+  --edition=ENTERPRISE --processing-units=100
+gcloud spanner databases create <db> --instance=<name> \
+  --database-dialect=GOOGLE_STANDARD_SQL
+```
+
+| Test | What it covers |
+|------|---------------|
+| `test_gcs_storage_integration` | GCS set / has / get / delete |
+| `test_gcs_child_and_find` | child() client sharing, find() with pattern + file_filter |
+| `test_gcs_keys_and_clear` | keys() listing, clear() |
+| `test_gcs_cache_factory_integration` | GCS-backed JsonPipelineCache via CacheFactory |
+| `test_spanner_storage_integration` | Spanner blob CRUD |
+| `test_spanner_child_prefix_isolation` | child() prefix stacking, parent/child table isolation |
+| `test_spanner_find_and_keys` | find() pattern + file_filter + max_count, keys() |
+| `test_spanner_table_storage_integration` | DataFrame write/read with JSON / ARRAY / null |
+| `test_spanner_auto_table_creation` | set_table() auto-creates missing table |
+| `test_spanner_schema_evolution` | set_table() auto-alters table to add columns |
+| `test_spanner_load_empty_table_columns` | load_table() on empty table returns correct columns |
+| `test_spanner_vector_store_integration` | Vector load, search_by_id, similarity search |
+| `test_spanner_vector_store_auto_creation` | Vector table + index auto-created on first write |
+| `test_spanner_vector_auto_create_with_length` | Verifies `vector_length=>N` constraint in INFORMATION_SCHEMA |
+| `test_spanner_storage_factory_integration` | StorageFactory creates SpannerPipelineStorage from config |
+
 ## Gotchas
 
 - **Spanner BYTES encoding**: The Python client inconsistently handles `bytes` columns. Always Base64-encode writes explicitly and use `FROM_BASE64()` in DML. Retain heuristic Base64 decoding on reads as a defensive measure.
