@@ -23,6 +23,11 @@ from graphrag.vector_stores.base import (
 
 logger = logging.getLogger(__name__)
 
+# DDL for a vector index can take several minutes; use a longer timeout than
+# plain table creation.
+_DDL_TIMEOUT_SECONDS: int = 600
+_VECTOR_INDEX_DDL_TIMEOUT_SECONDS: int = 900
+
 # ---------------------------------------------------------------------------
 # SQL-injection guard (mirrors spanner_pipeline_storage._safe_identifier)
 # ---------------------------------------------------------------------------
@@ -107,8 +112,7 @@ class SpannerVectorStore(BaseVectorStore):
 
         logger.info("Creating vector table and index %s if not exists...", self.index_name)
         operation = self._database.update_ddl([table_ddl, index_ddl])
-        # Index creation might take longer, so we increase the timeout
-        operation.result(timeout=900)
+        operation.result(timeout=_VECTOR_INDEX_DDL_TIMEOUT_SECONDS)
         logger.info("Vector table and index %s created (or already existed).", self.index_name)
 
     def load_documents(
@@ -172,6 +176,11 @@ class SpannerVectorStore(BaseVectorStore):
         self, query_embedding: list[float], k: int = 10, **kwargs: Any
     ) -> list[VectorStoreSearchResult]:
         """Perform a vector-based similarity search."""
+        # Consume and immediately clear the filter so it does not leak into
+        # subsequent searches that do not call filter_by_id().
+        active_filter = self.query_filter
+        self.query_filter = None
+
         where_clause = ""
         params = {"query_vector": query_embedding, "k": k}
         param_types_map = {
@@ -185,10 +194,10 @@ class SpannerVectorStore(BaseVectorStore):
         _vec = _safe_identifier(self.vector_field)
         _attrs = _safe_identifier(self.attributes_field)
 
-        if self.query_filter:
+        if active_filter:
             where_clause = f"WHERE {_id} IN UNNEST(@include_ids)"
-            params["include_ids"] = self.query_filter
-            if isinstance(self.query_filter[0], int):
+            params["include_ids"] = active_filter
+            if isinstance(active_filter[0], int):
                 param_types_map["include_ids"] = param_types.Array(param_types.INT64)
             else:
                 param_types_map["include_ids"] = param_types.Array(param_types.STRING)

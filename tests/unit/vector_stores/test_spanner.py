@@ -361,13 +361,9 @@ class TestSpannerVectorStore(unittest.TestCase):
         for identifier in (self.index_name, self.config.id_field):
             self.assertIn(f"`{identifier}`", sql)
 
-    def test_query_filter_persists_across_searches(self):
-        """Document known behaviour: query_filter is NOT cleared after a search.
-
-        This means a second search without calling filter_by_id() will still
-        carry the filter from the previous call.  This test pins the current
-        behaviour so any accidental change is caught.
-        """
+    def test_query_filter_cleared_after_search(self):
+        """query_filter must be consumed and cleared by similarity_search_by_vector()
+        so it does not leak into subsequent searches."""
         mock_snapshot = MagicMock()
         self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
         mock_snapshot.execute_sql.return_value = []
@@ -375,10 +371,13 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.store.filter_by_id(["only-once"])
         self.store.similarity_search_by_vector([0.1, 0.2, 0.3])
 
-        # Reset to observe only the second call
+        # The filter must be gone after the first search
+        self.assertIsNone(self.store.query_filter)
+
+        # Reset mock to observe the second call independently
         mock_snapshot.execute_sql.reset_mock()
         self.store.similarity_search_by_vector([0.1, 0.2, 0.3])
 
         args, _ = mock_snapshot.execute_sql.call_args
-        # The WHERE clause is still present — filter was not cleared
-        self.assertIn("WHERE", args[0])
+        # No WHERE clause in the second search — filter was not reapplied
+        self.assertNotIn("WHERE", args[0])

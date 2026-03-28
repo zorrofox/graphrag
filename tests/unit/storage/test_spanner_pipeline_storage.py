@@ -82,6 +82,11 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.storage._sanitize_table_name("table-with-hyphens"), "table_with_hyphens")
         self.assertEqual(self.storage._sanitize_table_name("table.with.dots"), "table_with_dots")
         self.assertEqual(self.storage._sanitize_table_name("mixed-table.name"), "mixed_table_name")
+        # Characters beyond hyphen and dot are now also replaced
+        self.assertEqual(self.storage._sanitize_table_name("table with spaces"), "table_with_spaces")
+        self.assertEqual(self.storage._sanitize_table_name("table@v2!"), "table_v2_")
+        # Names starting with a digit get a t_ prefix
+        self.assertEqual(self.storage._sanitize_table_name("2024_report"), "t_2024_report")
 
     async def test_set_table(self):
         df = pd.DataFrame({"col1": [1, 2], "col2": ["a", "b"]})

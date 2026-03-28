@@ -26,6 +26,21 @@ from graphrag.utils.spanner_resource_manager import SpannerResourceManager
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# DDL timeout
+# ---------------------------------------------------------------------------
+
+# How long to wait for a Spanner DDL operation (CREATE/ALTER TABLE) to complete.
+# Exposed as a constant so callers can override it in tests or configuration.
+_DDL_TIMEOUT_SECONDS: int = 600
+
+# ---------------------------------------------------------------------------
+# Table-name sanitisation
+# ---------------------------------------------------------------------------
+
+# Characters not allowed in Spanner identifiers are replaced with underscore.
+_UNSAFE_TABLE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
+
+# ---------------------------------------------------------------------------
 # SQL-injection guard
 # ---------------------------------------------------------------------------
 
@@ -53,8 +68,16 @@ class SpannerPipelineStorage(PipelineStorage):
     """The Google Cloud Spanner implementation."""
 
     def _sanitize_table_name(self, name: str) -> str:
-        """Sanitize table name to comply with Spanner naming rules."""
-        return name.replace(".", "_").replace("-", "_")
+        """Sanitize *name* so it is a valid Spanner identifier.
+
+        Replaces every character outside ``[A-Za-z0-9_]`` with an underscore,
+        then prepends ``t_`` if the result starts with a digit (Spanner
+        identifiers must begin with a letter or underscore).
+        """
+        sanitized = _UNSAFE_TABLE_CHARS_RE.sub("_", name)
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"t_{sanitized}"
+        return sanitized
 
     def __init__(self, **kwargs: Any) -> None:
         project_id = kwargs.get("project_id")
@@ -188,7 +211,7 @@ class SpannerPipelineStorage(PipelineStorage):
 
         logger.info("Creating table %s with DDL: %s", table_name, ddl)
         operation = self._database.update_ddl([ddl])
-        operation.result(timeout=600)
+        operation.result(timeout=_DDL_TIMEOUT_SECONDS)
         logger.info("Table %s created successfully.", table_name)
         return inferred_schema
 
@@ -220,7 +243,7 @@ class SpannerPipelineStorage(PipelineStorage):
         ]
         logger.info("Altering table %s with DDL: %s", table_name, alter_statements)
         operation = self._database.update_ddl(alter_statements)
-        operation.result(timeout=600)
+        operation.result(timeout=_DDL_TIMEOUT_SECONDS)
         logger.info("Table %s altered successfully.", table_name)
 
     def _batch_insert(self, table_name: str, columns: tuple[str, ...], values: list[tuple[Any, ...]]) -> None:
@@ -391,7 +414,7 @@ class SpannerPipelineStorage(PipelineStorage):
             updated_at TIMESTAMP OPTIONS (allow_commit_timestamp=true),
         ) PRIMARY KEY (key)"""
         operation = self._database.update_ddl([ddl])
-        operation.result(timeout=600)
+        operation.result(timeout=_DDL_TIMEOUT_SECONDS)
 
     async def set(self, key: str, value: Any, encoding: str | None = None) -> None:
         """Set a blob in Spanner."""
