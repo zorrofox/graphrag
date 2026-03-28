@@ -70,6 +70,7 @@ dependencies = [
     # Google Cloud
     "google-cloud-storage>=2.14.0",
     "google-cloud-spanner>=3.40.0",
+    "google-cloud-aiplatform>=1.38.0",
 ]
 
 [dependency-groups]

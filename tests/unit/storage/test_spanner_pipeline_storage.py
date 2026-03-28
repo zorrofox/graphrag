@@ -615,6 +615,119 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "")
 
+    # ------------------------------------------------------------------
+    # New tests for Tasks 1–5
+    # ------------------------------------------------------------------
+
+    def test_schema_cache_evicts_lru_when_full(self):
+        """Schema cache should evict the oldest entry when it reaches max size."""
+        from graphrag.storage.spanner_pipeline_storage import _SCHEMA_CACHE_MAX_SIZE
+
+        # Fill the cache to the max size
+        for i in range(_SCHEMA_CACHE_MAX_SIZE):
+            self.storage._schema_cache[f"table_{i}"] = {"col": "STRING(MAX)"}
+
+        self.assertEqual(len(self.storage._schema_cache), _SCHEMA_CACHE_MAX_SIZE)
+
+        # Mock snapshot so _get_table_schema calls succeed with a real schema
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = iter([["new_col", "INT64"]])
+
+        # Fetching a brand-new table should evict "table_0" (the oldest)
+        self.storage._get_table_schema("brand_new_table")
+
+        self.assertNotIn("table_0", self.storage._schema_cache)
+        self.assertIn("brand_new_table", self.storage._schema_cache)
+        self.assertEqual(len(self.storage._schema_cache), _SCHEMA_CACHE_MAX_SIZE)
+
+    async def test_load_table_passes_limit_offset(self):
+        """load_table() should include LIMIT/OFFSET in the SQL when provided."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+
+        mock_results = MagicMock()
+        mock_results.__iter__.return_value = iter([[1, "a"]])
+        field1 = MagicMock()
+        field1.name = "col1"
+        field2 = MagicMock()
+        field2.name = "col2"
+        mock_results.fields = [field1, field2]
+        mock_snapshot.execute_sql.return_value = mock_results
+
+        await self.storage.load_table("TestTable", limit=10, offset=5)
+
+        call_args = mock_snapshot.execute_sql.call_args
+        sql = call_args[0][0]
+        self.assertIn("LIMIT", sql)
+        self.assertIn("OFFSET", sql)
+        params = call_args[1]["params"]
+        self.assertEqual(params["lim"], 10)
+        self.assertEqual(params["off"], 5)
+
+    async def test_get_creation_date_reads_created_at_column(self):
+        """get_creation_date() should read the 'created_at' column, not 'updated_at'."""
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = [[dt]]
+
+        await self.storage.get_creation_date("test.txt")
+
+        mock_snapshot.read.assert_called_once()
+        call_args = mock_snapshot.read.call_args
+        # Second positional argument is the list of columns
+        columns_arg = call_args[0][1]
+        self.assertEqual(columns_arg, ["created_at"])
+
+    async def test_set_uses_insert_for_new_key(self):
+        """set() should use INSERT (not INSERT OR UPDATE) for a new key."""
+        captured: dict = {}
+
+        def capture_transaction(func, *args, **kwargs):
+            mock_txn = MagicMock()
+            # Simulate no AlreadyExists so INSERT path is taken
+            mock_txn.execute_update.return_value = 1
+            func(mock_txn)
+            captured["sql"] = mock_txn.execute_update.call_args[0][0]
+            captured["call_count"] = mock_txn.execute_update.call_count
+
+        self.mock_database.run_in_transaction.side_effect = capture_transaction
+
+        await self.storage.set("new_key", b"value")
+
+        # Should have called execute_update exactly once (INSERT path only)
+        self.assertEqual(captured["call_count"], 1)
+        self.assertIn("INSERT INTO", captured["sql"])
+        self.assertNotIn("INSERT OR UPDATE", captured["sql"])
+        self.assertIn("created_at", captured["sql"])
+
+    async def test_set_uses_update_for_existing_key(self):
+        """set() should fall back to UPDATE when INSERT raises AlreadyExists."""
+        sqls: list[str] = []
+
+        def capture_transaction(func, *args, **kwargs):
+            mock_txn = MagicMock()
+            # First execute_update call raises AlreadyExists; second succeeds
+            mock_txn.execute_update.side_effect = [
+                exceptions.AlreadyExists("Row already exists"),
+                1,
+            ]
+            func(mock_txn)
+            sqls.extend(
+                call[0][0] for call in mock_txn.execute_update.call_args_list
+            )
+
+        self.mock_database.run_in_transaction.side_effect = capture_transaction
+
+        await self.storage.set("existing_key", b"updated_value")
+
+        self.assertEqual(len(sqls), 2)
+        self.assertIn("INSERT INTO", sqls[0])
+        self.assertIn("UPDATE", sqls[1])
+        self.assertNotIn("created_at", sqls[1])
+
 
 class TestSafeIdentifier(unittest.TestCase):
     """Tests for the module-level _safe_identifier() guard."""
@@ -723,4 +836,16 @@ class TestInferSpannerType(unittest.TestCase):
         """None values should be skipped before type inference."""
         self.assertEqual(
             self._infer(pd.Series([None, ["a", "b"]])), "ARRAY<STRING(MAX)>"
+        )
+
+    def test_infer_spanner_type_mixed_detects_json(self):
+        """Series with mixed dict and str values should resolve to JSON."""
+        self.assertEqual(
+            self._infer(pd.Series([{}, "text"])), "JSON"
+        )
+
+    def test_infer_spanner_type_uses_multiple_samples(self):
+        """Series with inconsistent list/dict elements should resolve to JSON."""
+        self.assertEqual(
+            self._infer(pd.Series([[], [], {}, {}])), "JSON"
         )

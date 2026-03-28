@@ -100,6 +100,23 @@ class VectorStoreConfig(BaseModel):
         default=None,
     )
 
+    location: str | None = Field(
+        description="The GCP region for Vertex AI Vector Search, e.g. 'us-central1'.",
+        default=None,
+    )
+    index_id: str | None = Field(
+        description="The Vertex AI MatchingEngineIndex resource name or numeric ID.",
+        default=None,
+    )
+    index_endpoint_id: str | None = Field(
+        description="The Vertex AI MatchingEngineIndexEndpoint resource name or numeric ID.",
+        default=None,
+    )
+    deployed_index_id: str | None = Field(
+        description="The deployed index ID registered on the Vertex AI IndexEndpoint.",
+        default=None,
+    )
+
     embeddings_schema: dict[str, VectorStoreSchemaConfig] = {}
 
     def _validate_embeddings_schema(self) -> None:

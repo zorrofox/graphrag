@@ -133,13 +133,15 @@ Implemented in `feat: Spanner Emulator support via SPANNER_EMULATOR_HOST env var
 
 ---
 
-### Vertex AI Vector Search backend
+### ~~Vertex AI Vector Search backend~~ DONE
 
-Implement a `VertexAIVectorStore(BaseVectorStore)` for billion-scale workloads.
+~~Implement a `VertexAIVectorStore(BaseVectorStore)` for billion-scale workloads.~~
 
-**Target file:** `graphrag/vector_stores/vertexai.py`
-**Config model change:** add `VectorStoreType.vertexai = "vertexai"` to enums
-**Reference:** `google-cloud-aiplatform` SDK — `MatchingEngineIndex`
+**Implemented:** `graphrag/vector_stores/vertexai.py` — `VertexAIVectorStore` using
+`google-cloud-aiplatform` SDK (`MatchingEngineIndex` / `MatchingEngineIndexEndpoint`).
+`VectorStoreType.VertexAI = "vertexai"` added to enums; registered in factory;
+config fields (`location`, `index_id`, `index_endpoint_id`, `deployed_index_id`)
+added to `VectorStoreConfig`.
 
 ---
 

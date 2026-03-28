@@ -12,6 +12,7 @@ from graphrag.vector_stores.azure_ai_search import AzureAISearchVectorStore
 from graphrag.vector_stores.cosmosdb import CosmosDBVectorStore
 from graphrag.vector_stores.lancedb import LanceDBVectorStore
 from graphrag.vector_stores.spanner import SpannerVectorStore
+from graphrag.vector_stores.vertexai import VertexAIVectorStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -96,3 +97,4 @@ VectorStoreFactory.register(
 )
 VectorStoreFactory.register(VectorStoreType.CosmosDB.value, CosmosDBVectorStore)
 VectorStoreFactory.register(VectorStoreType.Spanner.value, SpannerVectorStore)
+VectorStoreFactory.register(VectorStoreType.VertexAI.value, VertexAIVectorStore)

@@ -9,6 +9,7 @@ import binascii
 import json
 import logging
 import re
+from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 
@@ -45,6 +46,12 @@ _UNSAFE_TABLE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
 # ---------------------------------------------------------------------------
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# ---------------------------------------------------------------------------
+# Schema cache size limit
+# ---------------------------------------------------------------------------
+
+_SCHEMA_CACHE_MAX_SIZE = 256
 
 
 def _safe_identifier(name: str) -> str:
@@ -109,13 +116,14 @@ class SpannerPipelineStorage(PipelineStorage):
             database_id=database_id,
             credentials=credentials,
         )
-        self._schema_cache = {}
+        # Bounded LRU cache: evicts oldest entry when full.
+        self._schema_cache: OrderedDict[str, dict[str, str]] = OrderedDict()
 
     def _get_table_schema(self, table_name: str) -> dict[str, str]:
         """Get table schema from cache or Spanner."""
         if table_name in self._schema_cache:
             return self._schema_cache[table_name]
-        
+
         try:
             with self._database.snapshot() as snapshot:
                 results = snapshot.execute_sql(
@@ -125,6 +133,8 @@ class SpannerPipelineStorage(PipelineStorage):
                 )
                 schema = {row[0]: row[1] for row in results}
                 if schema:
+                    if len(self._schema_cache) >= _SCHEMA_CACHE_MAX_SIZE:
+                        self._schema_cache.popitem(last=False)  # evict LRU (oldest)
                     self._schema_cache[table_name] = schema
                 return schema
         except Exception as e:
@@ -141,48 +151,57 @@ class SpannerPipelineStorage(PipelineStorage):
             return "BOOL"
         if pd.api.types.is_datetime64_any_dtype(series):
             return "TIMESTAMP"
-        
-        # Object types
+
+        # Object types — sample up to 10 non-null values for majority-vote inference.
         non_null = series.dropna()
         if len(non_null) == 0:
             return "STRING(MAX)"
-        
-        first_val = non_null.iloc[0]
-        if isinstance(first_val, str):
-            return "STRING(MAX)"
-        if isinstance(first_val, bool):
-            return "BOOL"
-        if isinstance(first_val, (int, np.integer)):
-            return "INT64"
-        if isinstance(first_val, (float, np.floating)):
-            return "FLOAT64"
 
-        if isinstance(first_val, (list, tuple, np.ndarray)):
-            found_non_empty = False
-            for val in non_null:
-                if len(val) > 0:
-                    found_non_empty = True
+        SAMPLE_SIZE = 10
+        samples = non_null.head(SAMPLE_SIZE)
+
+        detected: list[str] = []
+        for val in samples:
+            if isinstance(val, bool):
+                detected.append("BOOL")
+            elif isinstance(val, str):
+                detected.append("STRING(MAX)")
+            elif isinstance(val, (int, np.integer)):
+                detected.append("INT64")
+            elif isinstance(val, (float, np.floating)):
+                detected.append("FLOAT64")
+            elif isinstance(val, dict):
+                detected.append("JSON")
+            elif isinstance(val, (list, tuple, np.ndarray)):
+                # Determine element type from first non-empty list
+                if len(val) == 0:
+                    detected.append("ARRAY<STRING(MAX)>")
+                else:
                     first_elem = val[0]
                     if isinstance(first_elem, str):
-                        return "ARRAY<STRING(MAX)>"
-                    if isinstance(first_elem, (int, np.integer)):
-                        return "ARRAY<INT64>"
-                    if isinstance(first_elem, (float, np.floating)):
-                        return "ARRAY<FLOAT64>"
-                    if isinstance(first_elem, (dict, list, tuple)):
-                        return "JSON"
-                    # If mixed or unknown primitive, fallback to JSON
-                    return "JSON"
-            
-            if not found_non_empty:
-                 # All lists are empty. Default to ARRAY<STRING(MAX)> as it's most common for IDs in GraphRAG.
-                 return "ARRAY<STRING(MAX)>"
+                        detected.append("ARRAY<STRING(MAX)>")
+                    elif isinstance(first_elem, (int, np.integer)):
+                        detected.append("ARRAY<INT64>")
+                    elif isinstance(first_elem, (float, np.floating)):
+                        detected.append("ARRAY<FLOAT64>")
+                    elif isinstance(first_elem, (dict, list, tuple)):
+                        detected.append("JSON")
+                    else:
+                        detected.append("JSON")
+            else:
+                detected.append("STRING(MAX)")
+
+        if not detected:
+            return "STRING(MAX)"
+
+        # Majority vote; if not unanimous → "JSON"
+        most_common = max(set(detected), key=detected.count)
+        if detected.count(most_common) < len(detected):
             return "JSON"
 
-        if isinstance(first_val, dict):
-            return "JSON"
-            
-        return "STRING(MAX)"
+        # Special case: all-empty-lists → ARRAY<STRING(MAX)>
+        # (already handled above, but make the intent explicit)
+        return most_common
 
     def _create_table_if_not_exists(self, table_name: str, df: pd.DataFrame) -> dict[str, str]:
         """Create a Spanner table based on DataFrame schema and return the inferred schema.
@@ -303,8 +322,8 @@ class SpannerPipelineStorage(PipelineStorage):
             values = self._prepare_values(df, columns, schema)
 
             try:
-                self._batch_insert(table_name, columns, values)
-                return # Success
+                await asyncio.to_thread(self._batch_insert, table_name, columns, values)
+                return  # Success
             except exceptions.NotFound as e:
                 if attempt >= max_retries:
                     raise
@@ -323,22 +342,42 @@ class SpannerPipelineStorage(PipelineStorage):
                 else:
                     raise
             except exceptions.FailedPrecondition as e:
-                 # Handle "Expected JSON" error if it happens despite our best efforts,
-                 # maybe schema cache was stale.
-                 if "Expected JSON" in str(e) and attempt < max_retries:
-                      logger.warning("Got Expected JSON error for table %s, refreshing schema and retrying.", table_name)
-                      self._schema_cache.pop(table_name, None)
-                      continue
-                 raise
+                # Handle "Expected JSON" error if it happens despite our best efforts,
+                # maybe schema cache was stale.
+                if "Expected JSON" in str(e) and attempt < max_retries:
+                    logger.warning("Got Expected JSON error for table %s, refreshing schema and retrying.", table_name)
+                    self._schema_cache.pop(table_name, None)
+                    continue
+                raise
 
-    async def load_table(self, name: str) -> pd.DataFrame:
-        """Load a table from Spanner."""
+    async def load_table(self, name: str, limit: int | None = None, offset: int = 0) -> pd.DataFrame:
+        """Load a table from Spanner with optional pagination."""
+        return await asyncio.to_thread(self._load_table_sync, name, limit, offset)
+
+    def _load_table_sync(self, name: str, limit: int | None = None, offset: int = 0) -> pd.DataFrame:
+        """Synchronous core for load_table()."""
         sanitized_name = self._sanitize_table_name(name)
         table_name = f"{self._table_prefix}{sanitized_name}"
+
+        sql = f"SELECT * FROM {_safe_identifier(table_name)}"
+        params: dict = {}
+        param_types_map: dict = {}
+        if limit is not None:
+            sql += " LIMIT @lim OFFSET @off"
+            params = {"lim": limit, "off": offset}
+            param_types_map = {
+                "lim": spanner.param_types.INT64,
+                "off": spanner.param_types.INT64,
+            }
+
         with self._database.snapshot() as snapshot:
-            results = snapshot.execute_sql(f"SELECT * FROM {_safe_identifier(table_name)}")
+            results = snapshot.execute_sql(
+                sql,
+                params=params or None,
+                param_types=param_types_map or None,
+            )
             rows = list(results)
-            
+
             columns = []
             if results.fields:
                 columns = [field.name for field in results.fields]
@@ -356,8 +395,8 @@ class SpannerPipelineStorage(PipelineStorage):
 
             return pd.DataFrame(rows, columns=columns if columns else None)
 
-    async def has_table(self, name: str) -> bool:
-        """Check if a table exists."""
+    def _has_table_sync(self, name: str) -> bool:
+        """Synchronous core for has_table()."""
         sanitized_name = self._sanitize_table_name(name)
         table_name = f"{self._table_prefix}{sanitized_name}"
         try:
@@ -369,10 +408,14 @@ class SpannerPipelineStorage(PipelineStorage):
         except Exception:
             return False
 
-    async def get(
+    async def has_table(self, name: str) -> bool:
+        """Check if a table exists."""
+        return await asyncio.to_thread(self._has_table_sync, name)
+
+    def _get_sync(
         self, key: str, as_bytes: bool | None = False, encoding: str | None = None
     ) -> Any:
-        """Get a blob from Spanner."""
+        """Synchronous core for get()."""
         try:
             with self._database.snapshot() as snapshot:
                 # Using read instead of execute_sql for simple key lookup
@@ -383,18 +426,18 @@ class SpannerPipelineStorage(PipelineStorage):
                 for r in result:
                     row = r
                     break
-                
+
                 if not row:
                     return None
                 data = row[0]
-                
+
                 # Workaround: If data is bytes and looks like base64, try to decode it.
                 if isinstance(data, bytes):
                     try:
                         decoded = base64.b64decode(data, validate=True)
                         # Stronger validation: re-encode must match exactly.
                         if base64.b64encode(decoded) == data:
-                             data = decoded
+                            data = decoded
                     except (binascii.Error, ValueError):
                         pass
 
@@ -405,14 +448,23 @@ class SpannerPipelineStorage(PipelineStorage):
             logger.warning("Error getting key %s from Spanner", key)
             return None
 
+    async def get(
+        self, key: str, as_bytes: bool | None = False, encoding: str | None = None
+    ) -> Any:
+        """Get a blob from Spanner."""
+        return await asyncio.to_thread(self._get_sync, key, as_bytes, encoding)
+
     def _ensure_blobs_table_exists(self) -> None:
         """Ensure the Blobs table exists."""
         logger.info("Ensuring Blob table %s exists.", self._blob_table)
-        ddl = f"""CREATE TABLE IF NOT EXISTS `{self._blob_table}` (
-            key STRING(MAX) NOT NULL,
-            value BYTES(MAX),
-            updated_at TIMESTAMP OPTIONS (allow_commit_timestamp=true),
-        ) PRIMARY KEY (key)"""
+        ddl = (
+            f"CREATE TABLE IF NOT EXISTS `{self._blob_table}` (\n"
+            "    `key`        STRING(MAX) NOT NULL,\n"
+            "    `value`      BYTES(MAX),\n"
+            "    `created_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true),\n"
+            "    `updated_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true)\n"
+            f") PRIMARY KEY (`key`)"
+        )
         operation = self._database.update_ddl([ddl])
         operation.result(timeout=_DDL_TIMEOUT_SECONDS)
 
@@ -422,10 +474,10 @@ class SpannerPipelineStorage(PipelineStorage):
             value = value.encode(encoding or "utf-8")
 
         if not isinstance(value, bytes):
-             try:
-                 value = str(value).encode(encoding or "utf-8")
-             except Exception:
-                 raise ValueError(f"Spanner blob storage expects bytes, got {type(value)}")
+            try:
+                value = str(value).encode(encoding or "utf-8")
+            except Exception:
+                raise ValueError(f"Spanner blob storage expects bytes, got {type(value)}")
 
         # Use FROM_BASE64 in DML to bypass client-side type inference issues.
         value_base64 = base64.b64encode(value).decode("ascii")
@@ -433,36 +485,49 @@ class SpannerPipelineStorage(PipelineStorage):
         safe_table = _safe_identifier(self._blob_table)
 
         def _write_blob(transaction):
-            # Pass value_base64 as a bound @val parameter — never interpolated
-            # into the SQL string — to eliminate the SQL-injection risk that
-            # existed when the base64 string was embedded directly in the query.
-            sql = (
-                f"INSERT OR UPDATE {safe_table} (key, value, updated_at) "
-                "VALUES (@key, FROM_BASE64(@val), PENDING_COMMIT_TIMESTAMP())"
+            # Try INSERT first (sets both created_at and updated_at).
+            sql_insert = (
+                f"INSERT INTO {safe_table} (key, value, created_at, updated_at) "
+                "VALUES (@key, FROM_BASE64(@val), PENDING_COMMIT_TIMESTAMP(), PENDING_COMMIT_TIMESTAMP())"
             )
-            transaction.execute_update(
-                sql,
-                params={"key": key, "val": value_base64},
-                param_types={
-                    "key": spanner.param_types.STRING,
-                    "val": spanner.param_types.STRING,
-                },
-            )
+            try:
+                transaction.execute_update(
+                    sql_insert,
+                    params={"key": key, "val": value_base64},
+                    param_types={
+                        "key": spanner.param_types.STRING,
+                        "val": spanner.param_types.STRING,
+                    },
+                )
+            except exceptions.AlreadyExists:
+                # Key exists → UPDATE value + updated_at, preserve created_at.
+                sql_update = (
+                    f"UPDATE {safe_table} SET value = FROM_BASE64(@val), "
+                    "updated_at = PENDING_COMMIT_TIMESTAMP() WHERE key = @key"
+                )
+                transaction.execute_update(
+                    sql_update,
+                    params={"key": key, "val": value_base64},
+                    param_types={
+                        "key": spanner.param_types.STRING,
+                        "val": spanner.param_types.STRING,
+                    },
+                )
 
         try:
-            self._database.run_in_transaction(_write_blob)
+            await asyncio.to_thread(self._database.run_in_transaction, _write_blob)
         except (exceptions.NotFound, exceptions.InvalidArgument) as e:
             # Spanner DML returns InvalidArgument when table is missing,
             # Mutation API returns NotFound. We catch both to be safe.
             if "Table not found" in str(e):
                 logger.info("Table not found error caught in set(): %s", e)
                 await asyncio.to_thread(self._ensure_blobs_table_exists)
-                self._database.run_in_transaction(_write_blob)
+                await asyncio.to_thread(self._database.run_in_transaction, _write_blob)
             else:
                 raise
 
-    async def has(self, key: str) -> bool:
-        """Check if a blob exists in Spanner."""
+    def _has_sync(self, key: str) -> bool:
+        """Synchronous core for has()."""
         try:
             with self._database.snapshot() as snapshot:
                 result = snapshot.read(
@@ -474,13 +539,21 @@ class SpannerPipelineStorage(PipelineStorage):
         except Exception:
             return False
 
-    async def delete(self, key: str) -> None:
-        """Delete a blob from Spanner."""
+    async def has(self, key: str) -> bool:
+        """Check if a blob exists in Spanner."""
+        return await asyncio.to_thread(self._has_sync, key)
+
+    def _delete_sync(self, key: str) -> None:
+        """Synchronous core for delete()."""
         with self._database.batch() as batch:
             batch.delete(self._blob_table, keyset=spanner.KeySet(keys=[[key]]))
 
-    async def clear(self) -> None:
-        """Clear all blobs."""
+    async def delete(self, key: str) -> None:
+        """Delete a blob from Spanner."""
+        await asyncio.to_thread(self._delete_sync, key)
+
+    def _clear_sync(self) -> None:
+        """Synchronous core for clear()."""
         try:
             self._database.execute_partitioned_dml(
                 f"DELETE FROM {_safe_identifier(self._blob_table)} WHERE true"
@@ -488,6 +561,10 @@ class SpannerPipelineStorage(PipelineStorage):
         except Exception:
             logger.exception("Error clearing Spanner blobs")
             raise
+
+    async def clear(self) -> None:
+        """Clear all blobs."""
+        await asyncio.to_thread(self._clear_sync)
 
     def child(self, name: str | None) -> "PipelineStorage":
         """Create a child storage instance with a nested table prefix.
@@ -516,16 +593,20 @@ class SpannerPipelineStorage(PipelineStorage):
             )
             return [row[0] for row in result]
 
-    async def get_creation_date(self, key: str) -> str:
-        """Get creation date (updated_at) for a blob."""
+    def _get_creation_date_sync(self, key: str) -> str:
+        """Synchronous core for get_creation_date()."""
         with self._database.snapshot() as snapshot:
             result = snapshot.read(
-                self._blob_table, ["updated_at"], keyset=spanner.KeySet(keys=[[key]])
+                self._blob_table, ["created_at"], keyset=spanner.KeySet(keys=[[key]])
             )
             for row in result:
                 if row[0]:
                     return get_timestamp_formatted_with_local_tz(row[0])
             return ""
+
+    async def get_creation_date(self, key: str) -> str:
+        """Get creation date for a blob."""
+        return await asyncio.to_thread(self._get_creation_date_sync, key)
 
     def find(
         self,

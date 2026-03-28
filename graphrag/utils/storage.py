@@ -13,10 +13,10 @@ from graphrag.storage.pipeline_storage import PipelineStorage
 logger = logging.getLogger(__name__)
 
 
-async def load_table_from_storage(name: str, storage: PipelineStorage) -> pd.DataFrame:
+async def load_table_from_storage(name: str, storage: PipelineStorage, limit: int | None = None, offset: int = 0) -> pd.DataFrame:
     """Load a table from the storage instance."""
     if hasattr(storage, "load_table"):
-        return await storage.load_table(name)
+        return await storage.load_table(name, limit=limit, offset=offset)
 
     filename = f"{name}.parquet"
     if not await storage.has(filename):
