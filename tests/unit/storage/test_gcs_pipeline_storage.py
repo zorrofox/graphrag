@@ -4,7 +4,9 @@
 import re
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+
+from google.api_core.exceptions import ServiceUnavailable, TooManyRequests
 
 from graphrag.storage.gcs_pipeline_storage import GCSPipelineStorage
 
@@ -236,3 +238,57 @@ class TestGCSPipelineStorage(unittest.IsolatedAsyncioTestCase):
         result = await self.storage.get_creation_date("missing.txt")
 
         self.assertEqual(result, "")
+
+    async def test_get_retries_on_transient_error(self):
+        """get() should retry once on TooManyRequests and return the result."""
+        key = "file.txt"
+        content = b"hello world"
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        # Raise TooManyRequests on first download, then succeed on second
+        mock_blob.download_as_bytes.side_effect = [
+            TooManyRequests("rate limited"),
+            content,
+        ]
+        self.mock_bucket.blob.return_value = mock_blob
+
+        result = await self.storage.get(key, as_bytes=True)
+
+        self.assertEqual(result, content)
+        self.assertEqual(mock_blob.download_as_bytes.call_count, 2)
+
+    async def test_set_retries_on_service_unavailable(self):
+        """set() should retry once on ServiceUnavailable and succeed."""
+        key = "file.txt"
+        value = "hello world"
+        mock_blob = MagicMock()
+        # Raise ServiceUnavailable on first upload, then succeed on second
+        mock_blob.upload_from_string.side_effect = [
+            ServiceUnavailable("service down"),
+            None,
+        ]
+        self.mock_bucket.blob.return_value = mock_blob
+
+        await self.storage.set(key, value)
+
+        self.assertEqual(mock_blob.upload_from_string.call_count, 2)
+
+    def test_find_passes_max_results_to_list_blobs(self):
+        """find() should call list_blobs with max_results=1000 and page_size=1000."""
+        self.mock_client.list_blobs.return_value = []
+
+        list(self.storage.find(re.compile(r".*\.txt$")))
+
+        call_kwargs = self.mock_client.list_blobs.call_args
+        self.assertEqual(call_kwargs.kwargs.get("max_results"), 1000)
+        self.assertEqual(call_kwargs.kwargs.get("page_size"), 1000)
+
+    def test_keys_passes_max_results_to_list_blobs(self):
+        """keys() should call list_blobs with max_results=1000 and page_size=1000."""
+        self.mock_client.list_blobs.return_value = []
+
+        self.storage.keys()
+
+        call_kwargs = self.mock_client.list_blobs.call_args
+        self.assertEqual(call_kwargs.kwargs.get("max_results"), 1000)
+        self.assertEqual(call_kwargs.kwargs.get("page_size"), 1000)

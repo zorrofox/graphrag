@@ -10,6 +10,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from google.api_core import retry as api_retry
+from google.api_core.exceptions import InternalServerError, ServiceUnavailable, TooManyRequests
 from google.cloud import storage
 from google.cloud.storage.blob import Blob
 
@@ -19,6 +21,16 @@ from graphrag.storage.pipeline_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+_GCS_RETRY = api_retry.AsyncRetry(
+    predicate=api_retry.if_exception_type(
+        TooManyRequests, ServiceUnavailable, InternalServerError
+    ),
+    initial=1.0,
+    maximum=60.0,
+    multiplier=2.0,
+    deadline=300.0,
+)
 
 
 class GCSPipelineStorage(PipelineStorage):
@@ -101,7 +113,9 @@ class GCSPipelineStorage(PipelineStorage):
             )
 
         try:
-            blobs = self._client.list_blobs(self._bucket_name, prefix=search_path)
+            blobs = self._client.list_blobs(
+                self._bucket_name, prefix=search_path, max_results=1000, page_size=1000
+            )
 
             num_loaded = 0
             for blob in blobs:
@@ -126,9 +140,9 @@ class GCSPipelineStorage(PipelineStorage):
         """Get a value from GCS."""
         try:
             blob = self._bucket.blob(self._keyname(key))
-            if not await asyncio.to_thread(blob.exists):
+            if not await _GCS_RETRY(asyncio.to_thread)(blob.exists):
                 return None
-            data = await asyncio.to_thread(blob.download_as_bytes)
+            data = await _GCS_RETRY(asyncio.to_thread)(blob.download_as_bytes)
             if as_bytes:
                 return data
             return data.decode(encoding or self._encoding)
@@ -142,13 +156,13 @@ class GCSPipelineStorage(PipelineStorage):
             blob = self._bucket.blob(self._keyname(key))
             if isinstance(value, str):
                 coding = encoding or self._encoding
-                await asyncio.to_thread(
+                await _GCS_RETRY(asyncio.to_thread)(
                     blob.upload_from_string,
                     value,
                     content_type=f"text/plain; charset={coding}",
                 )
             elif isinstance(value, bytes):
-                await asyncio.to_thread(
+                await _GCS_RETRY(asyncio.to_thread)(
                     blob.upload_from_string,
                     value,
                     content_type="application/octet-stream",
@@ -163,7 +177,7 @@ class GCSPipelineStorage(PipelineStorage):
         """Check if a key exists in GCS."""
         try:
             blob = self._bucket.blob(self._keyname(key))
-            return await asyncio.to_thread(blob.exists)
+            return await _GCS_RETRY(asyncio.to_thread)(blob.exists)
         except Exception:
             logger.warning("Error checking if key %s exists in GCS", key)
             return False
@@ -172,8 +186,8 @@ class GCSPipelineStorage(PipelineStorage):
         """Delete a key from GCS."""
         try:
             blob = self._bucket.blob(self._keyname(key))
-            if await asyncio.to_thread(blob.exists):
-                await asyncio.to_thread(blob.delete)
+            if await _GCS_RETRY(asyncio.to_thread)(blob.exists):
+                await _GCS_RETRY(asyncio.to_thread)(blob.delete)
         except Exception:
             logger.exception("Error deleting key %s from GCS", key)
             raise
@@ -184,11 +198,11 @@ class GCSPipelineStorage(PipelineStorage):
             prefix = self._base_dir
             if prefix and not prefix.endswith("/"):
                 prefix += "/"
-            blobs = await asyncio.to_thread(
+            blobs = await _GCS_RETRY(asyncio.to_thread)(
                 lambda: list(self._client.list_blobs(self._bucket_name, prefix=prefix))
             )
             if blobs:
-                await asyncio.to_thread(self._bucket.delete_blobs, blobs)
+                await _GCS_RETRY(asyncio.to_thread)(self._bucket.delete_blobs, blobs)
         except Exception:
             logger.exception("Error clearing GCS storage at %s", self._base_dir)
             raise
@@ -212,7 +226,9 @@ class GCSPipelineStorage(PipelineStorage):
             if prefix and not prefix.endswith("/"):
                 prefix += "/"
             
-            blobs = self._client.list_blobs(self._bucket_name, prefix=prefix)
+            blobs = self._client.list_blobs(
+                self._bucket_name, prefix=prefix, max_results=1000, page_size=1000
+            )
             return [self._relativize_path(blob.name) for blob in blobs]
         except Exception:
             logger.exception("Error listing keys in GCS")
@@ -221,7 +237,7 @@ class GCSPipelineStorage(PipelineStorage):
     async def get_creation_date(self, key: str) -> str:
         """Get the creation date for the given key."""
         try:
-            blob = await asyncio.to_thread(self._bucket.get_blob, self._keyname(key))
+            blob = await _GCS_RETRY(asyncio.to_thread)(self._bucket.get_blob, self._keyname(key))
             if blob and blob.time_created:
                 return get_timestamp_formatted_with_local_tz(blob.time_created)
             return ""
