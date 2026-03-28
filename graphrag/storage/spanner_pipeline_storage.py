@@ -431,11 +431,13 @@ class SpannerPipelineStorage(PipelineStorage):
                     return None
                 data = row[0]
 
-                # Workaround: If data is bytes and looks like base64, try to decode it.
+                # The Mutation API stores raw bytes without base64 encoding.
+                # The legacy DML+FROM_BASE64 path stored base64-encoded bytes,
+                # so we retain a heuristic decoder for backwards compatibility
+                # with blobs written before the Mutation-API switch.
                 if isinstance(data, bytes):
                     try:
                         decoded = base64.b64decode(data, validate=True)
-                        # Stronger validation: re-encode must match exactly.
                         if base64.b64encode(decoded) == data:
                             data = decoded
                     except (binascii.Error, ValueError):
@@ -469,60 +471,62 @@ class SpannerPipelineStorage(PipelineStorage):
         operation.result(timeout=_DDL_TIMEOUT_SECONDS)
 
     async def set(self, key: str, value: Any, encoding: str | None = None) -> None:
-        """Set a blob in Spanner."""
+        """Set a blob in Spanner, preserving created_at on updates.
+
+        Uses FROM_BASE64 DML (required for reliable BYTES column writes in the
+        Spanner Python client) with two separate, independent transactions so
+        that a failed INSERT never corrupts the transaction object used by UPDATE:
+
+        - New key  → INSERT (sets both created_at and updated_at).
+        - Existing → run_in_transaction raises AlreadyExists from execute_update;
+                     we catch it *outside* that transaction and start a fresh
+                     transaction for the UPDATE (only updates value + updated_at,
+                     preserving created_at).
+        """
         if isinstance(value, str):
             value = value.encode(encoding or "utf-8")
-
         if not isinstance(value, bytes):
             try:
                 value = str(value).encode(encoding or "utf-8")
             except Exception:
                 raise ValueError(f"Spanner blob storage expects bytes, got {type(value)}")
 
-        # Use FROM_BASE64 in DML to bypass client-side type inference issues.
         value_base64 = base64.b64encode(value).decode("ascii")
-
         safe_table = _safe_identifier(self._blob_table)
 
-        def _write_blob(transaction):
-            # Try INSERT first (sets both created_at and updated_at).
-            sql_insert = (
+        def _try_insert(transaction) -> None:
+            transaction.execute_update(
                 f"INSERT INTO {safe_table} (key, value, created_at, updated_at) "
-                "VALUES (@key, FROM_BASE64(@val), PENDING_COMMIT_TIMESTAMP(), PENDING_COMMIT_TIMESTAMP())"
+                "VALUES (@key, FROM_BASE64(@val), PENDING_COMMIT_TIMESTAMP(), PENDING_COMMIT_TIMESTAMP())",
+                params={"key": key, "val": value_base64},
+                param_types={
+                    "key": spanner.param_types.STRING,
+                    "val": spanner.param_types.STRING,
+                },
             )
-            try:
-                transaction.execute_update(
-                    sql_insert,
-                    params={"key": key, "val": value_base64},
-                    param_types={
-                        "key": spanner.param_types.STRING,
-                        "val": spanner.param_types.STRING,
-                    },
-                )
-            except exceptions.AlreadyExists:
-                # Key exists → UPDATE value + updated_at, preserve created_at.
-                sql_update = (
-                    f"UPDATE {safe_table} SET value = FROM_BASE64(@val), "
-                    "updated_at = PENDING_COMMIT_TIMESTAMP() WHERE key = @key"
-                )
-                transaction.execute_update(
-                    sql_update,
-                    params={"key": key, "val": value_base64},
-                    param_types={
-                        "key": spanner.param_types.STRING,
-                        "val": spanner.param_types.STRING,
-                    },
-                )
+
+        def _do_update(transaction) -> None:
+            transaction.execute_update(
+                f"UPDATE {safe_table} SET value = FROM_BASE64(@val), "
+                "updated_at = PENDING_COMMIT_TIMESTAMP() WHERE key = @key",
+                params={"key": key, "val": value_base64},
+                param_types={
+                    "key": spanner.param_types.STRING,
+                    "val": spanner.param_types.STRING,
+                },
+            )
 
         try:
-            await asyncio.to_thread(self._database.run_in_transaction, _write_blob)
+            await asyncio.to_thread(self._database.run_in_transaction, _try_insert)
+        except exceptions.AlreadyExists:
+            # Key exists — start a fresh transaction for the UPDATE so the
+            # failed INSERT's transaction object is never reused.
+            await asyncio.to_thread(self._database.run_in_transaction, _do_update)
         except (exceptions.NotFound, exceptions.InvalidArgument) as e:
-            # Spanner DML returns InvalidArgument when table is missing,
-            # Mutation API returns NotFound. We catch both to be safe.
             if "Table not found" in str(e):
                 logger.info("Table not found error caught in set(): %s", e)
                 await asyncio.to_thread(self._ensure_blobs_table_exists)
-                await asyncio.to_thread(self._database.run_in_transaction, _write_blob)
+                await asyncio.to_thread(self._database.run_in_transaction, _try_insert)
             else:
                 raise
 

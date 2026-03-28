@@ -100,6 +100,31 @@ def test_get_vector_store_types():
     assert VectorStoreType.LanceDB.value in vector_store_types
     assert VectorStoreType.AzureAISearch.value in vector_store_types
     assert VectorStoreType.CosmosDB.value in vector_store_types
+    # GCP types
+    assert VectorStoreType.Spanner.value in vector_store_types
+    assert VectorStoreType.VertexAI.value in vector_store_types
+
+
+@pytest.mark.skip(reason="Vertex AI requires a pre-created index + endpoint — no live credentials in CI")
+def test_create_vertexai_vector_store():
+    """Smoke-test: VertexAIVectorStore is registered and instantiates without error."""
+    from graphrag.vector_stores.vertexai import VertexAIVectorStore
+
+    kwargs = {
+        "project_id": "my-project",
+        "location": "us-central1",
+        "index_id": "projects/123/locations/us-central1/indexes/456",
+        "index_endpoint_id": "projects/123/locations/us-central1/indexEndpoints/789",
+        "deployed_index_id": "my_deployed_index",
+    }
+    store = VectorStoreFactory.create_vector_store(
+        vector_store_type=VectorStoreType.VertexAI.value,
+        vector_store_schema_config=VectorStoreSchemaConfig(
+            index_name="my_index", vector_size=768
+        ),
+        kwargs=kwargs,
+    )
+    assert isinstance(store, VertexAIVectorStore)
 
 
 def test_create_unknown_vector_store():

@@ -138,9 +138,8 @@ async def test_create_final_documents_on_spanner(spanner_config):
         # 6. Cleanup
         try:
             print(f"Cleaning up tables with prefix: {prefix}")
-            client = storage._client
-            instance = client.instance(spanner_config["instance_id"])
-            database = instance.database(spanner_config["database_id"])
+            # Use the shared database reference managed by SpannerResourceManager
+            database = storage._database
             # Drop the tables we created
             ddl = [
                 f"DROP TABLE {prefix}documents",
@@ -245,9 +244,8 @@ async def test_create_final_text_units_on_spanner(spanner_config):
         # Cleanup
         try:
             print(f"Cleaning up tables with prefix: {prefix}")
-            client = storage._client
-            instance = client.instance(spanner_config["instance_id"])
-            database = instance.database(spanner_config["database_id"])
+            # Use the shared database reference managed by SpannerResourceManager
+            database = storage._database
             ddl = [
                 f"DROP TABLE {prefix}text_units",
                 f"DROP TABLE {prefix}entities",

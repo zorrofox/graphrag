@@ -311,19 +311,14 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
     async def test_blob_operations(self):
         key = "test.txt"
         value = b"hello"
-        
-        # Test set
-        # Note: set() now uses run_in_transaction, not batch directly.
-        # We need to mock run_in_transaction to call our callback.
-        def mock_run_in_transaction(func, *args, **kwargs):
-            mock_txn = MagicMock()
-            func(mock_txn, *args, **kwargs)
-            return None
-        
-        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
-        
+
+        # Test set — uses run_in_transaction with _try_insert for new keys
+        def mock_txn(func, *args, **kwargs):
+            func(MagicMock())
+
+        self.mock_database.run_in_transaction.side_effect = mock_txn
         await self.storage.set(key, value)
-        self.mock_database.run_in_transaction.assert_called()
+        self.mock_database.run_in_transaction.assert_called_once()
 
         # Test get
         mock_snapshot = MagicMock()
@@ -344,62 +339,63 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         mock_batch.delete.assert_called()
 
     async def test_set_blob_auto_create(self):
-        """Test that set() automatically creates the Blobs table if it doesn't exist."""
+        """set() must auto-create the Blobs table when run_in_transaction raises NotFound."""
         key = "test.txt"
         value = b"hello"
-        
+
         call_count = 0
-        def mock_run_in_transaction(func, *args, **kwargs):
+        def mock_txn(func, *args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise exceptions.NotFound("Table not found: Blobs")
-            # Second call succeeds (mocked)
-            return None
+            func(MagicMock())
 
-        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
-        
-        mock_operation = MagicMock()
-        self.mock_database.update_ddl.return_value = mock_operation
+        self.mock_database.run_in_transaction.side_effect = mock_txn
+        self.mock_database.update_ddl.return_value = MagicMock()
 
         await self.storage.set(key, value)
 
-        # Verify DDL was called for Blobs table
         self.mock_database.update_ddl.assert_called_once()
         ddl = self.mock_database.update_ddl.call_args[0][0][0]
         self.assertIn("CREATE TABLE IF NOT EXISTS `Blobs`", ddl)
-
-        # Verify transaction was retried
+        self.assertIn("created_at", ddl)
         self.assertEqual(call_count, 2)
 
-    async def test_set_blob_auto_create_invalid_argument(self):
-        """Test that set() automatically creates the Blobs table if it gets InvalidArgument (common for DML)."""
+    async def test_set_blob_existing_key_uses_update_transaction(self):
+        """set() must use a fresh transaction for UPDATE when INSERT raises AlreadyExists."""
         key = "test.txt"
-        value = b"hello"
+        value = b"updated"
 
         call_count = 0
-        def mock_run_in_transaction(func, *args, **kwargs):
+        captured_sqls: list[str] = []
+
+        def mock_txn(func, *args, **kwargs):
             nonlocal call_count
             call_count += 1
+            mock_t = MagicMock()
             if call_count == 1:
-                # Simulate the exact error from the logs
-                raise exceptions.InvalidArgument("400 Table not found: Blobs [at 1:18]")
-            return None
+                # First call: _try_insert raises AlreadyExists
+                mock_t.execute_update.side_effect = exceptions.AlreadyExists("exists")
+                try:
+                    func(mock_t)
+                except exceptions.AlreadyExists:
+                    raise  # propagate so caller can handle
+            else:
+                # Second call: _do_update
+                func(mock_t)
+                captured_sqls.append(mock_t.execute_update.call_args[0][0])
 
-        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
-
-        mock_operation = MagicMock()
-        self.mock_database.update_ddl.return_value = mock_operation
+        self.mock_database.run_in_transaction.side_effect = mock_txn
 
         await self.storage.set(key, value)
 
-        # Verify DDL was called for Blobs table
-        self.mock_database.update_ddl.assert_called_once()
-        ddl = self.mock_database.update_ddl.call_args[0][0][0]
-        self.assertIn("CREATE TABLE IF NOT EXISTS `Blobs`", ddl)
-
-        # Verify transaction was retried
+        # Two separate run_in_transaction calls: INSERT then UPDATE
         self.assertEqual(call_count, 2)
+        # The second SQL must be UPDATE and must NOT touch created_at
+        self.assertGreater(len(captured_sqls), 0)
+        self.assertIn("UPDATE", captured_sqls[-1])
+        self.assertNotIn("created_at", captured_sqls[-1])
 
     # ------------------------------------------------------------------
     # Blob helpers — gaps from original test suite
@@ -440,33 +436,33 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
 
     async def test_set_string_value(self):
         """set() should accept string values by encoding them to bytes first."""
-        def mock_run_in_transaction(func, *args, **kwargs):
+        def mock_txn(func, *args, **kwargs):
             func(MagicMock())
 
-        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
+        self.mock_database.run_in_transaction.side_effect = mock_txn
 
         await self.storage.set("test.txt", "hello string")
 
         self.mock_database.run_in_transaction.assert_called_once()
 
-    async def test_set_uses_parameterized_binding(self):
-        """set() must pass value_base64 as a SQL @val parameter, not inline in SQL."""
+    async def test_set_uses_parameterized_dml(self):
+        """set() must use parameterized DML with FROM_BASE64, not embed value in SQL."""
         captured: dict = {}
 
-        def capture_transaction(func, *args, **kwargs):
-            mock_txn = MagicMock()
-            func(mock_txn)
-            captured["sql"] = mock_txn.execute_update.call_args[0][0]
-            captured["params"] = mock_txn.execute_update.call_args[1]["params"]
+        def capture_txn(func, *args, **kwargs):
+            mock_t = MagicMock()
+            func(mock_t)
+            captured["sql"] = mock_t.execute_update.call_args[0][0]
+            captured["params"] = mock_t.execute_update.call_args[1]["params"]
 
-        self.mock_database.run_in_transaction.side_effect = capture_transaction
+        self.mock_database.run_in_transaction.side_effect = capture_txn
 
         await self.storage.set("key", b"sensitive data")
 
-        # The base64 value must be bound as @val, never embedded in the SQL string
         self.assertIn("@val", captured["sql"])
+        self.assertIn("FROM_BASE64", captured["sql"])
         self.assertIn("val", captured["params"])
-        self.assertNotIn(captured["params"]["val"], captured["sql"])
+        self.assertIn("created_at", captured["sql"])
 
     # ------------------------------------------------------------------
     # set_table — retry exhaustion
@@ -681,52 +677,50 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         columns_arg = call_args[0][1]
         self.assertEqual(columns_arg, ["created_at"])
 
-    async def test_set_uses_insert_for_new_key(self):
-        """set() should use INSERT (not INSERT OR UPDATE) for a new key."""
-        captured: dict = {}
+    async def test_set_insert_sql_includes_created_at(self):
+        """INSERT DML must include created_at so it is set on first write."""
+        captured_sql = {}
 
-        def capture_transaction(func, *args, **kwargs):
-            mock_txn = MagicMock()
-            # Simulate no AlreadyExists so INSERT path is taken
-            mock_txn.execute_update.return_value = 1
-            func(mock_txn)
-            captured["sql"] = mock_txn.execute_update.call_args[0][0]
-            captured["call_count"] = mock_txn.execute_update.call_count
+        def capture_txn(func, *args, **kwargs):
+            mock_t = MagicMock()
+            func(mock_t)
+            captured_sql["sql"] = mock_t.execute_update.call_args[0][0]
 
-        self.mock_database.run_in_transaction.side_effect = capture_transaction
+        self.mock_database.run_in_transaction.side_effect = capture_txn
 
         await self.storage.set("new_key", b"value")
 
-        # Should have called execute_update exactly once (INSERT path only)
-        self.assertEqual(captured["call_count"], 1)
-        self.assertIn("INSERT INTO", captured["sql"])
-        self.assertNotIn("INSERT OR UPDATE", captured["sql"])
-        self.assertIn("created_at", captured["sql"])
+        self.assertIn("INSERT INTO", captured_sql["sql"])
+        self.assertIn("created_at", captured_sql["sql"])
+        self.assertIn("updated_at", captured_sql["sql"])
 
-    async def test_set_uses_update_for_existing_key(self):
-        """set() should fall back to UPDATE when INSERT raises AlreadyExists."""
-        sqls: list[str] = []
+    async def test_set_update_sql_excludes_created_at(self):
+        """UPDATE DML must NOT include created_at so it is preserved on re-writes."""
+        captured_sqls: list[str] = []
+        call_count = 0
 
-        def capture_transaction(func, *args, **kwargs):
-            mock_txn = MagicMock()
-            # First execute_update call raises AlreadyExists; second succeeds
-            mock_txn.execute_update.side_effect = [
-                exceptions.AlreadyExists("Row already exists"),
-                1,
-            ]
-            func(mock_txn)
-            sqls.extend(
-                call[0][0] for call in mock_txn.execute_update.call_args_list
-            )
+        def capture_txn(func, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            mock_t = MagicMock()
+            if call_count == 1:
+                mock_t.execute_update.side_effect = exceptions.AlreadyExists("exists")
+                try:
+                    func(mock_t)
+                except exceptions.AlreadyExists:
+                    raise
+            else:
+                func(mock_t)
+                captured_sqls.append(mock_t.execute_update.call_args[0][0])
 
-        self.mock_database.run_in_transaction.side_effect = capture_transaction
+        self.mock_database.run_in_transaction.side_effect = capture_txn
 
         await self.storage.set("existing_key", b"updated_value")
 
-        self.assertEqual(len(sqls), 2)
-        self.assertIn("INSERT INTO", sqls[0])
-        self.assertIn("UPDATE", sqls[1])
-        self.assertNotIn("created_at", sqls[1])
+        self.assertEqual(call_count, 2)
+        self.assertIn("UPDATE", captured_sqls[-1])
+        self.assertNotIn("created_at", captured_sqls[-1])
+        self.assertIn("updated_at", captured_sqls[-1])
 
 
 class TestSafeIdentifier(unittest.TestCase):

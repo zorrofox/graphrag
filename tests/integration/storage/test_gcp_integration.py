@@ -13,6 +13,7 @@ Run with real GCP credentials:
     uv run poe test_integration
 """
 
+import json
 import os
 import re
 import pytest
@@ -22,6 +23,7 @@ from uuid import uuid4
 from google.cloud import spanner
 
 from graphrag.cache.factory import CacheFactory
+from graphrag.cache.gcs_litellm_cache import GCSLiteLLMCache
 from graphrag.cache.json_pipeline_cache import JsonPipelineCache
 from graphrag.config.enums import CacheType, StorageType
 from graphrag.config.models.storage_config import StorageConfig
@@ -80,6 +82,7 @@ def setup_spanner_tables():
         """CREATE TABLE IF NOT EXISTS `IntegrationTestBlobs` (
             `key`        STRING(MAX) NOT NULL,
             `value`      BYTES(MAX),
+            `created_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true),
             `updated_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true)
         ) PRIMARY KEY (`key`)""",
         """CREATE TABLE IF NOT EXISTS `TestVectorTable` (
@@ -95,8 +98,17 @@ def setup_spanner_tables():
         """CREATE TABLE IF NOT EXISTS `FactoryTest_Blobs` (
             `key`        STRING(MAX) NOT NULL,
             `value`      BYTES(MAX),
+            `created_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true),
             `updated_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true)
         ) PRIMARY KEY (`key`)""",
+    ]
+
+    # Migrate pre-existing tables that may lack the created_at column.
+    migration_ddl = [
+        "ALTER TABLE `IntegrationTestBlobs` ADD COLUMN IF NOT EXISTS "
+        "`created_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true)",
+        "ALTER TABLE `FactoryTest_Blobs` ADD COLUMN IF NOT EXISTS "
+        "`created_at` TIMESTAMP OPTIONS (allow_commit_timestamp=true)",
     ]
 
     try:
@@ -104,6 +116,12 @@ def setup_spanner_tables():
         operation.result(timeout=600)
     except Exception as e:
         print(f"Warning: DDL setup failed (tables may already exist): {e}")
+
+    try:
+        operation = database.update_ddl(migration_ddl)
+        operation.result(timeout=300)
+    except Exception as e:
+        print(f"Warning: Migration DDL failed (column may already exist): {e}")
 
     # Clean pre-existing data so tests start from a known state.
     try:
@@ -839,3 +857,144 @@ async def test_spanner_storage_factory_integration(spanner_config, setup_spanner
         except Exception:
             pass
         storage.close()
+
+
+# ---------------------------------------------------------------------------
+# New feature: load_table() pagination
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spanner_load_table_pagination(spanner_config):
+    """load_table(limit=N, offset=M) must return the correct slice of rows."""
+    if not all(spanner_config.values()):
+        pytest.skip("Spanner config not set")
+
+    table_name = f"PaginationTest_{uuid4().hex[:8]}"
+    storage = SpannerPipelineStorage(**spanner_config, table_prefix="")
+
+    # Write 15 rows
+    df = pd.DataFrame({
+        "id": [f"row{i:02d}" for i in range(15)],
+        "val": list(range(15)),
+    })
+
+    try:
+        await storage.set_table(table_name, df)
+
+        # First page
+        page1 = await storage.load_table(table_name, limit=5, offset=0)
+        assert len(page1) == 5
+
+        # Second page
+        page2 = await storage.load_table(table_name, limit=5, offset=5)
+        assert len(page2) == 5
+
+        # Pages must not overlap
+        ids1 = set(page1["id"])
+        ids2 = set(page2["id"])
+        assert ids1.isdisjoint(ids2), "Pages must not share rows"
+
+        # Last page (5 remaining)
+        page3 = await storage.load_table(table_name, limit=5, offset=10)
+        assert len(page3) == 5
+
+        # All 15 rows covered
+        all_ids = ids1 | ids2 | set(page3["id"])
+        assert len(all_ids) == 15
+
+        # No limit → full table
+        full = await storage.load_table(table_name)
+        assert len(full) == 15
+
+    finally:
+        try:
+            client   = spanner.Client(project=spanner_config["project_id"])
+            instance = client.instance(spanner_config["instance_id"])
+            database = instance.database(spanner_config["database_id"])
+            database.update_ddl([f"DROP TABLE `{table_name}`"]).result(timeout=120)
+        except Exception as e:
+            print(f"Warning: cleanup failed for `{table_name}`: {e}")
+        storage.close()
+
+
+# ---------------------------------------------------------------------------
+# New feature: get_creation_date() returns true creation time (created_at)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_spanner_blob_creation_date_preserved_on_update(spanner_config):
+    """created_at must be set on first write and not change on subsequent updates."""
+    if not all(spanner_config.values()):
+        pytest.skip("Spanner config not set")
+
+    unique = uuid4().hex[:8]
+    storage = SpannerPipelineStorage(
+        **spanner_config, table_prefix=f"CreatedAt_{unique}_"
+    )
+    key = "test-blob.bin"
+
+    try:
+        # First write — creates the blob and sets created_at
+        await storage.set(key, b"original content")
+        created_at_1 = await storage.get_creation_date(key)
+        assert created_at_1, "created_at must be non-empty after first write"
+
+        # Second write — updates value, must preserve created_at
+        await storage.set(key, b"updated content")
+        created_at_2 = await storage.get_creation_date(key)
+
+        assert created_at_2 == created_at_1, (
+            f"created_at must not change on update: {created_at_1!r} → {created_at_2!r}"
+        )
+
+        # Value must reflect the latest write
+        assert await storage.get(key, as_bytes=True) == b"updated content"
+
+    finally:
+        try:
+            await storage.delete(key)
+        except Exception:
+            pass
+        storage.close()
+
+
+# ---------------------------------------------------------------------------
+# New feature: LiteLLM GCS cache
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gcs_litellm_cache_integration(gcs_bucket):
+    """GCSLiteLLMCache must persist and retrieve LLM response dicts via GCS."""
+    if not gcs_bucket:
+        pytest.skip("GCS_BUCKET_NAME not set")
+
+    base_dir = f"it-litellm-{uuid4().hex[:8]}"
+    cache = GCSLiteLLMCache(bucket_name=gcs_bucket, base_dir=base_dir)
+
+    cache_key = f"test-llm-{uuid4().hex[:8]}"
+    llm_response = {
+        "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+        "model": "gpt-4",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    try:
+        # Miss before write
+        assert await cache.async_get_cache(cache_key) is None
+
+        # Write
+        await cache.async_set_cache(cache_key, llm_response)
+
+        # Hit after write
+        retrieved = await cache.async_get_cache(cache_key)
+        assert retrieved == llm_response, f"Expected {llm_response}, got {retrieved}"
+
+        # Second distinct key is a miss
+        assert await cache.async_get_cache("other-key") is None
+
+    finally:
+        try:
+            await cache._storage.clear()
+        except Exception:
+            pass
+        cache.close()
