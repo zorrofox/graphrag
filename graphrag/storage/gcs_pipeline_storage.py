@@ -3,6 +3,7 @@
 
 """Google Cloud Storage implementation of PipelineStorage."""
 
+import asyncio
 import logging
 import re
 from collections.abc import Iterator
@@ -42,9 +43,19 @@ class GCSPipelineStorage(PipelineStorage):
         self._bucket_name = bucket_name
         self._base_dir = base_dir or ""
 
-        logger.info("Creating GCS storage at bucket=%s, path=%s", self._bucket_name, self._base_dir)
+        # Accept a pre-created client so child() can share it instead of
+        # opening a new TCP connection for every sub-directory instance.
+        _existing_client = kwargs.get("_client")
+        if _existing_client is not None:
+            self._client = _existing_client
+        else:
+            logger.info(
+                "Creating GCS storage at bucket=%s, path=%s",
+                self._bucket_name,
+                self._base_dir,
+            )
+            self._client = storage.Client(credentials=credentials)
 
-        self._client = storage.Client(credentials=credentials)
         self._bucket = self._client.bucket(self._bucket_name)
 
     def find(
@@ -114,18 +125,13 @@ class GCSPipelineStorage(PipelineStorage):
     ) -> Any:
         """Get a value from GCS."""
         try:
-            blob_name = self._keyname(key)
-            blob = self._bucket.blob(blob_name)
-            
-            if not blob.exists():
+            blob = self._bucket.blob(self._keyname(key))
+            if not await asyncio.to_thread(blob.exists):
                 return None
-
-            data = blob.download_as_bytes()
+            data = await asyncio.to_thread(blob.download_as_bytes)
             if as_bytes:
                 return data
-            
-            coding = encoding or self._encoding
-            return data.decode(coding)
+            return data.decode(encoding or self._encoding)
         except Exception:
             logger.warning("Error getting key %s from GCS", key)
             return None
@@ -133,20 +139,22 @@ class GCSPipelineStorage(PipelineStorage):
     async def set(self, key: str, value: Any, encoding: str | None = None) -> None:
         """Set a value in GCS."""
         try:
-            blob_name = self._keyname(key)
-            blob = self._bucket.blob(blob_name)
-            
+            blob = self._bucket.blob(self._keyname(key))
             if isinstance(value, str):
                 coding = encoding or self._encoding
-                blob.upload_from_string(value, content_type=f"text/plain; charset={coding}")
+                await asyncio.to_thread(
+                    blob.upload_from_string,
+                    value,
+                    content_type=f"text/plain; charset={coding}",
+                )
             elif isinstance(value, bytes):
-                blob.upload_from_string(value, content_type="application/octet-stream")
+                await asyncio.to_thread(
+                    blob.upload_from_string,
+                    value,
+                    content_type="application/octet-stream",
+                )
             else:
-                # Fallback for other types, try converting to string or bytes if possible,
-                # or assume it's something acceptable by upload_from_string (like a file-like object? No, that's upload_from_file)
-                # For now, assume it's str or bytes as per typical usage.
                 raise TypeError(f"Unsupported value type for GCS set: {type(value)}")
-                
         except Exception:
             logger.exception("Error setting key %s in GCS", key)
             raise
@@ -154,9 +162,8 @@ class GCSPipelineStorage(PipelineStorage):
     async def has(self, key: str) -> bool:
         """Check if a key exists in GCS."""
         try:
-            blob_name = self._keyname(key)
-            blob = self._bucket.blob(blob_name)
-            return blob.exists()
+            blob = self._bucket.blob(self._keyname(key))
+            return await asyncio.to_thread(blob.exists)
         except Exception:
             logger.warning("Error checking if key %s exists in GCS", key)
             return False
@@ -164,13 +171,12 @@ class GCSPipelineStorage(PipelineStorage):
     async def delete(self, key: str) -> None:
         """Delete a key from GCS."""
         try:
-            blob_name = self._keyname(key)
-            blob = self._bucket.blob(blob_name)
-            if blob.exists():
-                blob.delete()
+            blob = self._bucket.blob(self._keyname(key))
+            if await asyncio.to_thread(blob.exists):
+                await asyncio.to_thread(blob.delete)
         except Exception:
-             logger.exception("Error deleting key %s from GCS", key)
-             raise
+            logger.exception("Error deleting key %s from GCS", key)
+            raise
 
     async def clear(self) -> None:
         """Clear the storage (delete all blobs in base_dir)."""
@@ -178,27 +184,25 @@ class GCSPipelineStorage(PipelineStorage):
             prefix = self._base_dir
             if prefix and not prefix.endswith("/"):
                 prefix += "/"
-            
-            blobs = list(self._client.list_blobs(self._bucket_name, prefix=prefix))
+            blobs = await asyncio.to_thread(
+                lambda: list(self._client.list_blobs(self._bucket_name, prefix=prefix))
+            )
             if blobs:
-                self._bucket.delete_blobs(blobs)
+                await asyncio.to_thread(self._bucket.delete_blobs, blobs)
         except Exception:
             logger.exception("Error clearing GCS storage at %s", self._base_dir)
             raise
 
     def child(self, name: str | None) -> "PipelineStorage":
-        """Create a child storage instance."""
+        """Create a child storage instance sharing the same GCS client."""
         if name is None:
             return self
-        
         new_base_dir = str(Path(self._base_dir) / name)
         return GCSPipelineStorage(
             bucket_name=self._bucket_name,
             base_dir=new_base_dir,
             encoding=self._encoding,
-            # Pass the same client/credentials if possible, but __init__ recreates client.
-            # Optimization: could share client if passed explicitly.
-            # For now, let it recreate to keep __init__ simple.
+            _client=self._client,  # reuse; avoids opening a new connection per sub-directory
         )
 
     def keys(self) -> list[str]:
@@ -217,8 +221,7 @@ class GCSPipelineStorage(PipelineStorage):
     async def get_creation_date(self, key: str) -> str:
         """Get the creation date for the given key."""
         try:
-            blob_name = self._keyname(key)
-            blob = self._bucket.get_blob(blob_name)
+            blob = await asyncio.to_thread(self._bucket.get_blob, self._keyname(key))
             if blob and blob.time_created:
                 return get_timestamp_formatted_with_local_tz(blob.time_created)
             return ""

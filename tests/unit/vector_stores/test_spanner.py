@@ -224,3 +224,119 @@ class TestSpannerVectorStore(unittest.TestCase):
             database_id=self.database_id,
         )
         self.assertEqual(store.index_name, "table_with_hyphens")
+
+    # ------------------------------------------------------------------
+    # similarity_search_by_text
+    # ------------------------------------------------------------------
+
+    def test_similarity_search_by_text(self):
+        """similarity_search_by_text() should embed the text and delegate to by_vector."""
+        query_vector = [0.1, 0.2, 0.3]
+        mock_embedder = MagicMock(return_value=query_vector)
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [
+            ["1", "doc1", [0.1, 0.2, 0.3], None, 0.1]
+        ]
+
+        results = self.store.similarity_search_by_text("test query", mock_embedder, k=5)
+
+        mock_embedder.assert_called_once_with("test query")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].document.id, "1")
+
+    def test_similarity_search_by_text_no_embedding(self):
+        """similarity_search_by_text() should return [] when the embedder returns None."""
+        mock_embedder = MagicMock(return_value=None)
+
+        results = self.store.similarity_search_by_text("query", mock_embedder)
+
+        self.assertEqual(results, [])
+        self.mock_database.snapshot.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Integer ID path
+    # ------------------------------------------------------------------
+
+    def test_filter_by_id_int_uses_int64_param_type(self):
+        """filter_by_id() with integer IDs should cause search to use INT64 param type."""
+        self.store.filter_by_id([1, 2, 3])
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        self.store.similarity_search_by_vector([0.1, 0.2, 0.3], k=5)
+
+        _, kwargs = mock_snapshot.execute_sql.call_args
+        self.assertEqual(
+            kwargs["param_types"]["include_ids"],
+            param_types.Array(param_types.INT64),
+        )
+
+    def test_search_by_id_int_uses_int64_param_type(self):
+        """search_by_id() with an integer should use INT64 param type."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        self.store.search_by_id(42)
+
+        _, kwargs = mock_snapshot.execute_sql.call_args
+        self.assertEqual(kwargs["param_types"]["id"], param_types.INT64)
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    def test_load_documents_empty_list(self):
+        """load_documents() with an empty list should be a no-op."""
+        self.store.load_documents([])
+
+        self.mock_database.batch.assert_not_called()
+
+    def test_connect_multiple_times_releases_previous(self):
+        """A second connect() call should release the previously acquired database."""
+        mock_db2 = MagicMock()
+        self.mock_resource_manager.get_database.return_value = mock_db2
+
+        self.store.connect(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+        )
+
+        # The first database (acquired in setUp) should have been released
+        self.mock_resource_manager.release_database.assert_called_once_with(
+            self.mock_database
+        )
+        self.assertEqual(self.store._database, mock_db2)
+
+    def test_connect_missing_params_raises(self):
+        """connect() without required params should raise ValueError."""
+        store = SpannerVectorStore(vector_store_schema_config=self.config)
+        with self.assertRaises(ValueError):
+            store.connect()
+
+    def test_query_filter_persists_across_searches(self):
+        """Document known behaviour: query_filter is NOT cleared after a search.
+
+        This means a second search without calling filter_by_id() will still
+        carry the filter from the previous call.  This test pins the current
+        behaviour so any accidental change is caught.
+        """
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        self.store.filter_by_id(["only-once"])
+        self.store.similarity_search_by_vector([0.1, 0.2, 0.3])
+
+        # Reset to observe only the second call
+        mock_snapshot.execute_sql.reset_mock()
+        self.store.similarity_search_by_vector([0.1, 0.2, 0.3])
+
+        args, _ = mock_snapshot.execute_sql.call_args
+        # The WHERE clause is still present — filter was not cleared
+        self.assertIn("WHERE", args[0])

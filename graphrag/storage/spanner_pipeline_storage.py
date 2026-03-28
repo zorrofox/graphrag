@@ -3,6 +3,7 @@
 
 """Google Cloud Spanner implementation of PipelineStorage."""
 
+import asyncio
 import base64
 import binascii
 import json
@@ -34,8 +35,8 @@ class SpannerPipelineStorage(PipelineStorage):
         instance_id = kwargs.get("instance_id")
         database_id = kwargs.get("database_id")
         credentials = kwargs.get("credentials")
-        
-        # Fix: Ensure table_prefix is an empty string if it's None, AND sanitize it.
+
+        # Ensure table_prefix is an empty string if it's None, AND sanitize it.
         raw_prefix = kwargs.get("table_prefix") or ""
         self._table_prefix = self._sanitize_table_name(raw_prefix)
         self._blob_table = f"{self._table_prefix}Blobs"
@@ -46,12 +47,18 @@ class SpannerPipelineStorage(PipelineStorage):
             msg = "project_id, instance_id, and database_id are required."
             raise ValueError(msg)
 
-        # Use the shared resource manager to get the Database object
+        # Store connection params so child() can create sibling instances.
+        self._project_id = project_id
+        self._instance_id = instance_id
+        self._database_id = database_id
+        self._credentials = credentials
+
+        # Use the shared resource manager to get the Database object.
         self._database = SpannerResourceManager.get_database(
             project_id=project_id,
             instance_id=instance_id,
             database_id=database_id,
-            credentials=credentials
+            credentials=credentials,
         )
         self._schema_cache = {}
 
@@ -129,61 +136,63 @@ class SpannerPipelineStorage(PipelineStorage):
         return "STRING(MAX)"
 
     def _create_table_if_not_exists(self, table_name: str, df: pd.DataFrame) -> dict[str, str]:
-        """Create a Spanner table based on DataFrame schema and return the inferred schema."""
+        """Create a Spanner table based on DataFrame schema and return the inferred schema.
+
+        This method is synchronous and intended to be called via asyncio.to_thread()
+        from async callers so it does not block the event loop.
+        """
         columns_ddl = []
         primary_key = "id" if "id" in df.columns else None
         inferred_schema = {}
-        
+
         for col_name in df.columns:
             spanner_type = self._infer_spanner_type(df[col_name])
             inferred_schema[col_name] = spanner_type
-            # Spanner PK must be NOT NULL
             nullable = " NOT NULL" if col_name == primary_key else ""
             columns_ddl.append(f"`{col_name}` {spanner_type}{nullable}")
 
         if not primary_key:
-             # Fallback: use first column as PK if no 'id'
-             primary_key = df.columns[0]
-             # Ensure PK is NOT NULL in DDL, and update schema if needed (though type shouldn't change)
-             columns_ddl[0] = f"`{primary_key}` {inferred_schema[primary_key]} NOT NULL"
+            # Fallback: use first column as PK if no 'id'
+            primary_key = df.columns[0]
+            columns_ddl[0] = f"`{primary_key}` {inferred_schema[primary_key]} NOT NULL"
 
         ddl = f"""CREATE TABLE `{table_name}` (
             {', '.join(columns_ddl)}
         ) PRIMARY KEY (`{primary_key}`)"""
-        
+
         logger.info("Creating table %s with DDL: %s", table_name, ddl)
-        
         operation = self._database.update_ddl([ddl])
         operation.result(timeout=600)
         logger.info("Table %s created successfully.", table_name)
         return inferred_schema
 
     def _alter_table_add_columns(self, table_name: str, df: pd.DataFrame) -> None:
-        """Alter a Spanner table to add missing columns."""
-        # We can use _get_table_schema here instead of raw query, but we want fresh data.
-        # Let's force refresh by not using cache here, or just use the raw query as before.
-        # Using raw query to be safe and sure we have latest state from Spanner.
+        """Alter a Spanner table to add missing columns.
+
+        Synchronous — call via asyncio.to_thread() from async methods.
+        """
         with self._database.snapshot() as snapshot:
             results = snapshot.execute_sql(
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @table_name",
                 params={"table_name": table_name},
-                param_types={"table_name": spanner.param_types.STRING}
+                param_types={"table_name": spanner.param_types.STRING},
             )
-            existing_columns = set(row[0] for row in results)
+            existing_columns = {row[0] for row in results}
 
         new_columns = [col for col in df.columns if col not in existing_columns]
-        
+
         if not new_columns:
-            logger.warning("Column not found error received, but no new columns detected for table %s.", table_name)
+            logger.warning(
+                "Column not found error received, but no new columns detected for table %s.",
+                table_name,
+            )
             return
 
-        alter_statements = []
-        for col in new_columns:
-            spanner_type = self._infer_spanner_type(df[col])
-            alter_statements.append(f"ALTER TABLE `{table_name}` ADD COLUMN `{col}` {spanner_type}")
-        
+        alter_statements = [
+            f"ALTER TABLE `{table_name}` ADD COLUMN `{col}` {self._infer_spanner_type(df[col])}"
+            for col in new_columns
+        ]
         logger.info("Altering table %s with DDL: %s", table_name, alter_statements)
-        
         operation = self._database.update_ddl(alter_statements)
         operation.result(timeout=600)
         logger.info("Table %s altered successfully.", table_name)
@@ -201,31 +210,35 @@ class SpannerPipelineStorage(PipelineStorage):
                 )
 
     def _prepare_values(self, df: pd.DataFrame, columns: tuple[str, ...], schema: dict[str, str]) -> list[tuple[Any, ...]]:
-        """Prepare DataFrame values for Spanner insertion, handling JSON serialization based on schema."""
-        values = []
-        for _, row in df.iterrows():
-            row_values = []
-            for col in columns:
-                val = row[col]
-                
-                # Handle numpy arrays (convert to list)
-                if isinstance(val, np.ndarray):
-                    val = val.tolist()
+        """Prepare DataFrame values for Spanner insertion.
 
-                col_type = schema.get(col, "").upper()
-                
-                if "JSON" in col_type:
-                     # FORCE JSON dump for list/dict if column is JSON
-                     if isinstance(val, (dict, list)):
-                         val = json.dumps(val)
-                elif isinstance(val, (dict, list)):
-                     # Fallback heuristic when schema is unknown
-                     if isinstance(val, dict) or (isinstance(val, list) and len(val) > 0 and isinstance(val[0], (dict, list))):
-                         val = json.dumps(val)
-                
-                row_values.append(val)
-            values.append(tuple(row_values))
-        return values
+        Processes column-by-column (instead of row-by-row via iterrows) for
+        significantly better performance on large DataFrames.
+        """
+        col_data: list[list[Any]] = []
+        for col in columns:
+            raw: list[Any] = df[col].tolist()  # fast vectorised extraction
+            col_type = schema.get(col, "").upper()
+            processed: list[Any] = []
+            if "JSON" in col_type:
+                for v in raw:
+                    if isinstance(v, np.ndarray):
+                        v = v.tolist()
+                    processed.append(json.dumps(v) if isinstance(v, (dict, list)) else v)
+            else:
+                for v in raw:
+                    if isinstance(v, np.ndarray):
+                        v = v.tolist()
+                    # Fallback heuristic: serialize nested structures to JSON
+                    if isinstance(v, dict) or (
+                        isinstance(v, list)
+                        and v
+                        and isinstance(v[0], (dict, list))
+                    ):
+                        v = json.dumps(v)
+                    processed.append(v)
+            col_data.append(processed)
+        return list(zip(*col_data))
 
     async def set_table(self, name: str, table: pd.DataFrame) -> None:
         """Write a dataframe to a Spanner table, creating or altering it if necessary."""
@@ -246,16 +259,18 @@ class SpannerPipelineStorage(PipelineStorage):
             except exceptions.NotFound as e:
                 if attempt >= max_retries:
                     raise
-                
+
                 msg = str(e)
                 if "Table not found" in msg:
-                     logger.info("Table %s not found, attempting to create it.", table_name)
-                     new_schema = self._create_table_if_not_exists(table_name, df)
-                     self._schema_cache[table_name] = new_schema
+                    logger.info("Table %s not found, attempting to create it.", table_name)
+                    new_schema = await asyncio.to_thread(
+                        self._create_table_if_not_exists, table_name, df
+                    )
+                    self._schema_cache[table_name] = new_schema
                 elif "Column not found" in msg:
-                     logger.info("Column mismatch for table %s, attempting to alter it.", table_name)
-                     self._alter_table_add_columns(table_name, df)
-                     self._schema_cache.pop(table_name, None) # Clear cache
+                    logger.info("Column mismatch for table %s, attempting to alter it.", table_name)
+                    await asyncio.to_thread(self._alter_table_add_columns, table_name, df)
+                    self._schema_cache.pop(table_name, None)
                 else:
                     raise
             except exceptions.FailedPrecondition as e:
@@ -379,15 +394,14 @@ class SpannerPipelineStorage(PipelineStorage):
         try:
             self._database.run_in_transaction(_write_blob)
         except (exceptions.NotFound, exceptions.InvalidArgument) as e:
-             # Spanner DML returns InvalidArgument when table is missing,
-             # Mutation API returns NotFound. We catch both to be safe.
-             if "Table not found" in str(e):
-                 logger.info("Table not found error caught in set(): %s", e)
-                 self._ensure_blobs_table_exists()
-                 # Retry write
-                 self._database.run_in_transaction(_write_blob)
-             else:
-                 raise
+            # Spanner DML returns InvalidArgument when table is missing,
+            # Mutation API returns NotFound. We catch both to be safe.
+            if "Table not found" in str(e):
+                logger.info("Table not found error caught in set(): %s", e)
+                await asyncio.to_thread(self._ensure_blobs_table_exists)
+                self._database.run_in_transaction(_write_blob)
+            else:
+                raise
 
     async def has(self, key: str) -> bool:
         """Check if a blob exists in Spanner."""
@@ -416,11 +430,23 @@ class SpannerPipelineStorage(PipelineStorage):
              raise
 
     def child(self, name: str | None) -> "PipelineStorage":
-        """Create a child storage instance."""
+        """Create a child storage instance with a nested table prefix.
+
+        Tables belonging to the child use the pattern:
+            <parent_prefix><sanitized_name>_<table>
+        The shared Spanner Database object is reused via SpannerResourceManager.
+        """
         if name is None:
             return self
-        # For simplicity, I'll just raise NotImplemented for now.
-        raise NotImplementedError("Child storage not implemented for Spanner yet.")
+        sanitized = self._sanitize_table_name(name)
+        new_prefix = f"{self._table_prefix}{sanitized}_"
+        return SpannerPipelineStorage(
+            project_id=self._project_id,
+            instance_id=self._instance_id,
+            database_id=self._database_id,
+            credentials=self._credentials,
+            table_prefix=new_prefix,
+        )
 
     def keys(self) -> list[str]:
         """List all blob keys."""

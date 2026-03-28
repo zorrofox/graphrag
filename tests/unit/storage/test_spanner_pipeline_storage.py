@@ -1,8 +1,11 @@
 # Copyright (c) 2024 Microsoft Corporation.
 # Licensed under the MIT License
 
+import base64
 import json
+import re
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -365,7 +368,7 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         """Test that set() automatically creates the Blobs table if it gets InvalidArgument (common for DML)."""
         key = "test.txt"
         value = b"hello"
-        
+
         call_count = 0
         def mock_run_in_transaction(func, *args, **kwargs):
             nonlocal call_count
@@ -376,7 +379,7 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
             return None
 
         self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
-        
+
         mock_operation = MagicMock()
         self.mock_database.update_ddl.return_value = mock_operation
 
@@ -389,3 +392,254 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
 
         # Verify transaction was retried
         self.assertEqual(call_count, 2)
+
+    # ------------------------------------------------------------------
+    # Blob helpers — gaps from original test suite
+    # ------------------------------------------------------------------
+
+    async def test_get_as_string(self):
+        """get() without as_bytes should return a decoded string."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = [[b"hello world"]]
+
+        result = await self.storage.get("test.txt", as_bytes=False)
+
+        self.assertEqual(result, "hello world")
+
+    async def test_get_base64_encoded_value(self):
+        """get() should transparently decode base64-wrapped bytes from Spanner."""
+        original = b"raw binary data"
+        encoded = base64.b64encode(original)  # what Spanner may return
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = [[encoded]]
+
+        result = await self.storage.get("test.bin", as_bytes=True)
+
+        self.assertEqual(result, original)
+
+    async def test_get_non_existent_key_returns_none(self):
+        """get() should return None when the key is not found."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = []  # no rows
+
+        result = await self.storage.get("missing_key")
+
+        self.assertIsNone(result)
+
+    async def test_set_string_value(self):
+        """set() should accept string values by encoding them to bytes first."""
+        def mock_run_in_transaction(func, *args, **kwargs):
+            func(MagicMock())
+
+        self.mock_database.run_in_transaction.side_effect = mock_run_in_transaction
+
+        await self.storage.set("test.txt", "hello string")
+
+        self.mock_database.run_in_transaction.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # set_table — retry exhaustion
+    # ------------------------------------------------------------------
+
+    async def test_set_table_retry_exhausted_raises(self):
+        """set_table() should re-raise NotFound after max_retries are exhausted."""
+        df = pd.DataFrame({"id": ["1"]})
+
+        mock_batch = MagicMock()
+        mock_batch.insert_or_update.side_effect = exceptions.NotFound("Table not found")
+        self.mock_database.batch.return_value.__enter__.return_value = mock_batch
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        self.mock_database.update_ddl.return_value = MagicMock()
+
+        with self.assertRaises(exceptions.NotFound):
+            await self.storage.set_table("FailTable", df)
+
+        # max_retries=2 → loop runs for attempts 0, 1, 2 → 3 insert attempts
+        self.assertEqual(mock_batch.insert_or_update.call_count, 3)
+
+    # ------------------------------------------------------------------
+    # clear / keys / find / child / get_creation_date
+    # ------------------------------------------------------------------
+
+    async def test_clear(self):
+        """clear() should execute partitioned DML against the blob table."""
+        await self.storage.clear()
+
+        self.mock_database.execute_partitioned_dml.assert_called_once()
+        sql = self.mock_database.execute_partitioned_dml.call_args[0][0]
+        self.assertIn("DELETE FROM", sql)
+        self.assertIn(self.storage._blob_table, sql)
+
+    def test_keys(self):
+        """keys() should return all blob key values."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [["key1"], ["key2"], ["key3"]]
+
+        keys = self.storage.keys()
+
+        self.assertEqual(keys, ["key1", "key2", "key3"])
+
+    def test_find_matches_pattern(self):
+        """find() should yield only keys matching the given pattern."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [
+            ["file1.txt"], ["file2.log"], ["file3.txt"]
+        ]
+
+        results = list(self.storage.find(re.compile(r".*\.txt$")))
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0][0], "file1.txt")
+        self.assertEqual(results[1][0], "file3.txt")
+
+    def test_find_with_max_count(self):
+        """find() should stop after max_count matches."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [
+            ["f1.txt"], ["f2.txt"], ["f3.txt"], ["f4.txt"]
+        ]
+
+        results = list(self.storage.find(re.compile(r".*\.txt$"), max_count=2))
+
+        self.assertEqual(len(results), 2)
+
+    def test_child_creates_prefixed_storage(self):
+        """child() should return a new SpannerPipelineStorage with a stacked table prefix."""
+        child = self.storage.child("reports")
+
+        self.assertIsInstance(child, SpannerPipelineStorage)
+        self.assertEqual(child._table_prefix, "reports_")
+        self.assertEqual(child._blob_table, "reports_Blobs")
+
+    def test_child_sanitizes_name(self):
+        """child() should sanitize hyphens and dots in the child name."""
+        child = self.storage.child("my-reports.v2")
+
+        self.assertEqual(child._table_prefix, "my_reports_v2_")
+
+    def test_child_stacks_on_parent_prefix(self):
+        """child() should prepend the parent's existing prefix."""
+        storage_with_prefix = SpannerPipelineStorage(
+            project_id=self.project_id,
+            instance_id=self.instance_id,
+            database_id=self.database_id,
+            table_prefix="app_",
+        )
+        child = storage_with_prefix.child("reports")
+
+        self.assertEqual(child._table_prefix, "app_reports_")
+
+    def test_child_none_returns_self(self):
+        """child(None) should return the same instance."""
+        result = self.storage.child(None)
+        self.assertIs(result, self.storage)
+
+    async def test_get_creation_date(self):
+        """get_creation_date() should return a non-empty string for an existing key."""
+        dt = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = [[dt]]
+
+        result = await self.storage.get_creation_date("test.txt")
+
+        self.assertIn("2024", result)
+        self.assertIn("06", result)
+        self.assertIn("15", result)
+
+    async def test_get_creation_date_not_found(self):
+        """get_creation_date() should return empty string when key is absent."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.read.return_value = []
+
+        result = await self.storage.get_creation_date("missing")
+
+        self.assertEqual(result, "")
+
+
+class TestInferSpannerType(unittest.TestCase):
+    """Unit tests for SpannerPipelineStorage._infer_spanner_type()."""
+
+    def setUp(self):
+        self.patcher = patch(
+            "graphrag.storage.spanner_pipeline_storage.SpannerResourceManager"
+        )
+        mock_rm = self.patcher.start()
+        mock_rm.get_database.return_value = MagicMock()
+        self.storage = SpannerPipelineStorage(
+            project_id="p", instance_id="i", database_id="d"
+        )
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    def _infer(self, series):
+        return self.storage._infer_spanner_type(series)
+
+    def test_integer_dtype(self):
+        self.assertEqual(self._infer(pd.Series([1, 2, 3])), "INT64")
+
+    def test_float_dtype(self):
+        self.assertEqual(self._infer(pd.Series([1.0, 2.0, 3.0])), "FLOAT64")
+
+    def test_bool_dtype(self):
+        self.assertEqual(self._infer(pd.Series([True, False, True])), "BOOL")
+
+    def test_datetime_dtype(self):
+        s = pd.Series(pd.to_datetime(["2021-01-01", "2021-01-02"]))
+        self.assertEqual(self._infer(s), "TIMESTAMP")
+
+    def test_string_dtype(self):
+        self.assertEqual(self._infer(pd.Series(["a", "b", "c"])), "STRING(MAX)")
+
+    def test_all_null(self):
+        """All-null series should default to STRING(MAX)."""
+        self.assertEqual(self._infer(pd.Series([None, None, None])), "STRING(MAX)")
+
+    def test_list_of_strings(self):
+        self.assertEqual(
+            self._infer(pd.Series([["tag1", "tag2"], ["tag3"]])),
+            "ARRAY<STRING(MAX)>",
+        )
+
+    def test_list_of_ints(self):
+        self.assertEqual(self._infer(pd.Series([[1, 2], [3, 4]])), "ARRAY<INT64>")
+
+    def test_list_of_floats(self):
+        self.assertEqual(
+            self._infer(pd.Series([[1.0, 2.0], [3.0]])), "ARRAY<FLOAT64>"
+        )
+
+    def test_dict_dtype(self):
+        self.assertEqual(
+            self._infer(pd.Series([{"key": "value"}, {"k2": "v2"}])), "JSON"
+        )
+
+    def test_list_of_dicts(self):
+        """A list whose elements are dicts should be inferred as JSON."""
+        self.assertEqual(self._infer(pd.Series([[{"key": "val"}]])), "JSON")
+
+    def test_all_empty_lists(self):
+        """All-empty lists should default to ARRAY<STRING(MAX)>."""
+        self.assertEqual(
+            self._infer(pd.Series([[], [], []])), "ARRAY<STRING(MAX)>"
+        )
+
+    def test_list_with_leading_null(self):
+        """None values should be skipped before type inference."""
+        self.assertEqual(
+            self._infer(pd.Series([None, ["a", "b"]])), "ARRAY<STRING(MAX)>"
+        )
