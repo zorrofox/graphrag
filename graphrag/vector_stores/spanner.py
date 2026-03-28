@@ -118,54 +118,67 @@ class SpannerVectorStore(BaseVectorStore):
     def load_documents(
         self, documents: list[VectorStoreDocument], overwrite: bool = True
     ) -> None:
-        """Load documents into vector storage."""
+        """Load documents into vector storage.
+
+        When *overwrite* is ``True`` (the default) the table is truncated before
+        inserting so that stale documents left over from a previous indexing run
+        are removed.  This matches the behaviour of the LanceDB and Azure AI
+        Search backends.
+
+        When *overwrite* is ``False`` existing rows are left intact and only the
+        provided documents are upserted.
+        """
         if not documents:
             return
 
-        # Note: 'overwrite=True' here is implemented as UPSERT (insert_or_update).
-        # It does NOT truncate the table before loading.
-
-        rows = []
-        for doc in documents:
-            rows.append(
-                (
-                    doc.id,
-                    doc.text,
-                    doc.vector,
-                    json.dumps(doc.attributes) if doc.attributes else None,
-                )
+        rows = [
+            (
+                doc.id,
+                doc.text,
+                doc.vector,
+                json.dumps(doc.attributes) if doc.attributes else None,
             )
+            for doc in documents
+        ]
+        columns = (self.id_field, self.text_field, self.vector_field, self.attributes_field)
+        safe_table = _safe_identifier(self.index_name)
 
-        try:
+        def _do_insert() -> None:
             with self._database.batch() as batch:
-                batch.insert_or_update(
-                    table=self.index_name,
-                    columns=(
-                        self.id_field,
-                        self.text_field,
-                        self.vector_field,
-                        self.attributes_field,
-                    ),
-                    values=rows,
+                batch.insert_or_update(table=self.index_name, columns=columns, values=rows)
+
+        def _is_table_not_found(exc: Exception) -> bool:
+            return "Table not found" in str(exc)
+
+        if overwrite:
+            # Try to truncate first.  If the table does not exist yet the DML
+            # will fail with InvalidArgument; we then create it and insert
+            # directly (the fresh table is already empty, no DELETE needed).
+            try:
+                self._database.execute_partitioned_dml(
+                    f"DELETE FROM {safe_table} WHERE true"
                 )
-        except exceptions.NotFound as e:
-            if "Table not found" in str(e):
-                logger.info("Table %s not found, attempting to create it.", self.index_name)
+            except (exceptions.NotFound, exceptions.InvalidArgument) as e:
+                if not _is_table_not_found(e):
+                    raise
+                logger.info(
+                    "Table %s not found on overwrite; creating it.", self.index_name
+                )
                 self._create_table_if_not_exists()
-                # Retry the insert
-                with self._database.batch() as batch:
-                    batch.insert_or_update(
-                        table=self.index_name,
-                        columns=(
-                            self.id_field,
-                            self.text_field,
-                            self.vector_field,
-                            self.attributes_field,
-                        ),
-                        values=rows,
-                    )
-            else:
-                raise
+                _do_insert()
+                return
+            # DELETE succeeded → table exists and is now empty → insert.
+            _do_insert()
+        else:
+            # overwrite=False: plain upsert, auto-create if table is absent.
+            try:
+                _do_insert()
+            except exceptions.NotFound as e:
+                if not _is_table_not_found(e):
+                    raise
+                logger.info("Table %s not found, creating it.", self.index_name)
+                self._create_table_if_not_exists()
+                _do_insert()
 
     def filter_by_id(self, include_ids: list[str] | list[int]) -> Any:
         """Build a query filter to filter documents by id."""

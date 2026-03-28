@@ -651,6 +651,103 @@ async def test_spanner_vector_store_auto_creation(spanner_config):
 
 
 @pytest.mark.asyncio
+async def test_spanner_vector_overwrite_removes_stale_documents(spanner_config):
+    """load_documents(overwrite=True) must remove docs not present in the new batch."""
+    if not all(spanner_config.values()):
+        pytest.skip("Spanner config not set")
+
+    index_name = f"OverwriteTest_{uuid4().hex[:8]}"
+    config = VectorStoreSchemaConfig(
+        index_name=index_name,
+        id_field="id",
+        text_field="text",
+        vector_field="vector",
+        attributes_field="attributes",
+        vector_size=3,
+    )
+    client   = spanner.Client(project=spanner_config["project_id"])
+    instance = client.instance(spanner_config["instance_id"])
+    database = instance.database(spanner_config["database_id"])
+
+    store = SpannerVectorStore(vector_store_schema_config=config, **spanner_config)
+    store.connect()
+
+    try:
+        # First load — two documents
+        store.load_documents([
+            VectorStoreDocument(id="stale",   text="will be removed", vector=[0.9, 0.0, 0.0]),
+            VectorStoreDocument(id="current", text="will stay",        vector=[0.1, 0.2, 0.3]),
+        ], overwrite=True)
+
+        # Second load — only one document, overwrite=True
+        store.load_documents([
+            VectorStoreDocument(id="current", text="updated", vector=[0.1, 0.2, 0.3]),
+        ], overwrite=True)
+
+        # "stale" must be gone
+        gone = store.search_by_id("stale")
+        assert gone.text is None, "Stale document must have been deleted by overwrite=True"
+
+        # "current" must still exist with updated text
+        kept = store.search_by_id("current")
+        assert kept.id == "current"
+        assert kept.text == "updated"
+
+    finally:
+        try:
+            op = database.update_ddl([f"DROP TABLE `{index_name}`"])
+            op.result(timeout=300)
+        except Exception as e:
+            print(f"Warning: Failed to drop `{index_name}`: {e}")
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_spanner_vector_overwrite_false_keeps_existing(spanner_config):
+    """load_documents(overwrite=False) must not remove pre-existing documents."""
+    if not all(spanner_config.values()):
+        pytest.skip("Spanner config not set")
+
+    index_name = f"UpsertTest_{uuid4().hex[:8]}"
+    config = VectorStoreSchemaConfig(
+        index_name=index_name,
+        id_field="id",
+        text_field="text",
+        vector_field="vector",
+        attributes_field="attributes",
+        vector_size=3,
+    )
+    client   = spanner.Client(project=spanner_config["project_id"])
+    instance = client.instance(spanner_config["instance_id"])
+    database = instance.database(spanner_config["database_id"])
+
+    store = SpannerVectorStore(vector_store_schema_config=config, **spanner_config)
+    store.connect()
+
+    try:
+        # Initial load
+        store.load_documents([
+            VectorStoreDocument(id="existing", text="original", vector=[0.1, 0.2, 0.3]),
+        ], overwrite=True)
+
+        # Second load with overwrite=False — must not delete "existing"
+        store.load_documents([
+            VectorStoreDocument(id="new", text="added", vector=[0.4, 0.5, 0.6]),
+        ], overwrite=False)
+
+        assert store.search_by_id("existing").text == "original"
+        assert store.search_by_id("new").text == "added"
+
+    finally:
+        try:
+            op = database.update_ddl([f"DROP TABLE `{index_name}`"])
+            op.result(timeout=300)
+        except Exception as e:
+            print(f"Warning: Failed to drop `{index_name}`: {e}")
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_spanner_vector_auto_create_with_length(spanner_config):
     """The auto-created vector column must have the correct vector_length constraint."""
     if not all(spanner_config.values()):

@@ -168,16 +168,16 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.assertIsNone(doc.vector)
 
     def test_load_documents_auto_create_table(self):
+        """With overwrite=True (default), auto-creation is triggered when the
+        DELETE (execute_partitioned_dml) fails with Table not found."""
         docs = [VectorStoreDocument(id="1", text="doc1", vector=[0.1, 0.2, 0.3])]
-        
+
         mock_batch = MagicMock()
         self.mock_database.batch.return_value.__enter__.return_value = mock_batch
-        
-        # First call raises NotFound, second call succeeds
-        mock_batch.insert_or_update.side_effect = [
-            exceptions.NotFound("Table not found"),
-            None
-        ]
+
+        # Spanner DML returns InvalidArgument when a table is missing
+        self.mock_database.execute_partitioned_dml.side_effect = \
+            exceptions.InvalidArgument("Table not found: test_table [at 1:13]")
 
         mock_operation = MagicMock()
         self.mock_database.update_ddl.return_value = mock_operation
@@ -188,17 +188,39 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.mock_database.update_ddl.assert_called_once()
         ddl_list = self.mock_database.update_ddl.call_args[0][0]
         self.assertEqual(len(ddl_list), 2)
-        
+
         # Check table DDL
         self.assertIn(f"CREATE TABLE IF NOT EXISTS `{self.index_name}`", ddl_list[0])
         self.assertIn(f"ARRAY<FLOAT64>(vector_length=>{self.config.vector_size})", ddl_list[0])
-        
+
         # Check index DDL
         self.assertIn(f"CREATE VECTOR INDEX IF NOT EXISTS `{self.index_name}_VectorIndex`", ddl_list[1])
         self.assertIn(f"WHERE `{self.config.vector_field}` IS NOT NULL", ddl_list[1])
         self.assertIn("OPTIONS (distance_type = 'COSINE')", ddl_list[1])
 
-        # Verify insert_or_update was called twice
+        # insert_or_update called exactly once (after creation, no pre-existing rows)
+        self.assertEqual(mock_batch.insert_or_update.call_count, 1)
+
+    def test_load_documents_overwrite_false_auto_create(self):
+        """With overwrite=False, auto-creation is triggered when insert raises NotFound."""
+        docs = [VectorStoreDocument(id="1", text="doc1", vector=[0.1, 0.2, 0.3])]
+
+        mock_batch = MagicMock()
+        self.mock_database.batch.return_value.__enter__.return_value = mock_batch
+        mock_batch.insert_or_update.side_effect = [
+            exceptions.NotFound("Table not found"),
+            None,
+        ]
+
+        mock_operation = MagicMock()
+        self.mock_database.update_ddl.return_value = mock_operation
+
+        self.store.load_documents(docs, overwrite=False)
+
+        self.mock_database.update_ddl.assert_called_once()
+        # No DELETE issued
+        self.mock_database.execute_partitioned_dml.assert_not_called()
+        # insert_or_update attempted twice (first fails, second succeeds after creation)
         self.assertEqual(mock_batch.insert_or_update.call_count, 2)
 
     def test_init_sanitizes_table_name(self):
@@ -295,6 +317,34 @@ class TestSpannerVectorStore(unittest.TestCase):
         self.store.load_documents([])
 
         self.mock_database.batch.assert_not_called()
+
+    def test_load_documents_overwrite_true_truncates_before_insert(self):
+        """overwrite=True must DELETE all rows before inserting new ones."""
+        docs = [VectorStoreDocument(id="1", text="new", vector=[0.1, 0.2, 0.3])]
+        mock_batch = MagicMock()
+        self.mock_database.batch.return_value.__enter__.return_value = mock_batch
+
+        self.store.load_documents(docs, overwrite=True)
+
+        # DELETE must have been issued via execute_partitioned_dml
+        self.mock_database.execute_partitioned_dml.assert_called_once()
+        sql = self.mock_database.execute_partitioned_dml.call_args[0][0]
+        self.assertIn("DELETE FROM", sql)
+        self.assertIn(f"`{self.index_name}`", sql)
+
+        # INSERT must follow
+        mock_batch.insert_or_update.assert_called_once()
+
+    def test_load_documents_overwrite_false_skips_delete(self):
+        """overwrite=False must NOT truncate the table before inserting."""
+        docs = [VectorStoreDocument(id="2", text="upsert", vector=[0.4, 0.5, 0.6])]
+        mock_batch = MagicMock()
+        self.mock_database.batch.return_value.__enter__.return_value = mock_batch
+
+        self.store.load_documents(docs, overwrite=False)
+
+        self.mock_database.execute_partitioned_dml.assert_not_called()
+        mock_batch.insert_or_update.assert_called_once()
 
     def test_connect_multiple_times_releases_previous(self):
         """A second connect() call should release the previously acquired database."""
