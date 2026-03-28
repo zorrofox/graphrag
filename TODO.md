@@ -116,15 +116,37 @@ Registered as `CacheType.gcs_litellm` in the cache factory.
 
 ---
 
-### GCS async client upgrade
+### GCS async client upgrade — 调研结论：暂缓，当前方案已是最佳实践
 
-Replace `google-cloud-storage` (synchronous) with a native async GCS client
-so `asyncio.to_thread()` is no longer needed.
+**调研日期：** 2026-03-28
 
-**Dependency change:** add `google-cloud-storage[async]` to `pyproject.toml`.
-Deferred — the current `asyncio.to_thread()` approach is correct and the
-async SDK is not yet production-stable for all operations.
+#### 现状
+
+| 方案 | 状态 | 说明 |
+|------|------|------|
+| `google-cloud-storage` 官方 async gRPC 客户端 | ❌ 实验性 | v3.4.0 (2024-09) 引入，代码在 `_experimental/` 模块，未覆盖标准 REST 上传/下载路径 |
+| `gcloud-aio-storage` | ✅ 生产就绪 | 社区维护，基于 `aiohttp` 实现真正 async I/O，v7.x 稳定，但引入新依赖且 API 与现有接口差异较大 |
+| `gcsfs` | ✅ 部分可用 | `asynchronous=True` 支持，但 `open()` 仍同步 |
+
+#### 结论
+
+当前 `asyncio.to_thread()` 方案是正确的，原因：
+1. 官方 `google-cloud-storage` async 支持尚在 `_experimental/`，不建议生产依赖
+2. `gcloud-aio-storage` 迁移成本高（API 不兼容，需重写 `GCSPipelineStorage`）
+3. `asyncio.to_thread()` 将阻塞 I/O 移入线程池，对 GCS 这类网络 I/O 操作实际开销极小
+
+#### 触发升级的条件
+
+满足以下任意一条时再重新评估：
+- 官方 `google-cloud-storage` async 支持升级为稳定版（移出 `_experimental/`）
+- 性能分析（profiling）证明线程池成为瓶颈
+- 项目决定引入 `gcloud-aio-storage` 作为新依赖
+
+**参考：**
+- [Issue #1366 — Async Storage Client](https://github.com/googleapis/python-storage/issues/1366)
+- [PR #1537 — feat(experimental): add async grpc client](https://github.com/googleapis/python-storage/pull/1537)
+- [gcloud-aio-storage](https://github.com/talkiq/gcloud-aio)
 
 ---
 
-*Last updated: 2026-03-28 — all items complete except GCS async client (deferred)*
+*Last updated: 2026-03-28 — 所有 TODO 项已完成；GCS async upgrade 调研后决定暂缓*
