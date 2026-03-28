@@ -83,16 +83,12 @@ most common type, or raise a `ValueError` on conflicting types.
 
 ---
 
-### P2 — `load_documents(overwrite=True)` does not truncate the table
+### ~~P2 — `load_documents(overwrite=True)` does not truncate the table~~ ✅ Done
 
-**File:** `spanner_vector_store.py` — `load_documents()`
-
-`overwrite=True` is implemented as `insert_or_update` (upsert).  Callers that
-expect a full replacement (as with `LanceDB`) will retain stale documents.
-
-**Suggested fix:** when `overwrite=True`, execute a `DELETE FROM <table>` via
-`database.execute_partitioned_dml()` before the batch insert.  Add a test that
-verifies stale rows are gone after a full reload.
+Fixed in commit `642d045`. `overwrite=True` now issues
+`execute_partitioned_dml("DELETE FROM ...")` before inserting, matching
+LanceDB behaviour. Auto-creation path correctly skips the DELETE when the
+table does not yet exist.
 
 ---
 
