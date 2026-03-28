@@ -23,6 +23,8 @@ class CacheType(str, Enum):
     """The cosmosdb cache configuration type"""
     gcs = "gcs"
     """The Google Cloud Storage cache configuration type."""
+    gcs_litellm = "gcs_litellm"
+    """The GCS-backed LiteLLM response cache configuration type."""
 
     def __repr__(self):
         """Get a string representation."""
@@ -72,6 +74,7 @@ class VectorStoreType(str, Enum):
     AzureAISearch = "azure_ai_search"
     CosmosDB = "cosmosdb"
     Spanner = "spanner"
+    VertexAI = "vertexai"
 
 
 class ReportingType(str, Enum):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
+from graphrag.cache.gcs_litellm_cache import GCSLiteLLMCache
 from graphrag.cache.json_pipeline_cache import JsonPipelineCache
 from graphrag.cache.memory_pipeline_cache import InMemoryCache
 from graphrag.cache.noop_pipeline_cache import NoopPipelineCache
@@ -114,6 +115,11 @@ def create_gcs_cache(**kwargs) -> PipelineCache:
     return JsonPipelineCache(storage)
 
 
+def create_gcs_litellm_cache(**kwargs) -> GCSLiteLLMCache:
+    """Create a GCS-backed LiteLLM response cache implementation."""
+    return GCSLiteLLMCache(**kwargs)
+
+
 # --- register built-in cache implementations ---
 CacheFactory.register(CacheType.none.value, create_noop_cache)
 CacheFactory.register(CacheType.memory.value, create_memory_cache)
@@ -121,3 +127,4 @@ CacheFactory.register(CacheType.file.value, create_file_cache)
 CacheFactory.register(CacheType.blob.value, create_blob_cache)
 CacheFactory.register(CacheType.cosmosdb.value, create_cosmosdb_cache)
 CacheFactory.register(CacheType.gcs.value, create_gcs_cache)
+CacheFactory.register(CacheType.gcs_litellm.value, create_gcs_litellm_cache)

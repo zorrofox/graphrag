@@ -143,14 +143,16 @@ Implement a `VertexAIVectorStore(BaseVectorStore)` for billion-scale workloads.
 
 ---
 
-### LiteLLM response cache backed by GCS
+### ~~LiteLLM response cache backed by GCS~~ DONE
 
-The project already depends on `litellm`.  Register `GCSPipelineStorage` as a
+~~The project already depends on `litellm`.  Register `GCSPipelineStorage` as a
 LiteLLM cache backend so repeated LLM calls with identical prompts are served
-from GCS instead of hitting the API.
+from GCS instead of hitting the API.~~
 
-**Suggested approach:** implement a thin `GCSCache` wrapper that satisfies
-LiteLLM's `BaseCache` interface and wire it up in the cache factory.
+**Implemented:** `graphrag/cache/gcs_litellm_cache.py` — `GCSLiteLLMCache` wraps
+`GCSPipelineStorage` and satisfies the LiteLLM `BaseCache` interface.
+Registered as `CacheType.gcs_litellm` in the cache factory.
+Tests in `tests/unit/cache/test_gcs_litellm_cache.py` (10/10 passing).
 
 ---
 
