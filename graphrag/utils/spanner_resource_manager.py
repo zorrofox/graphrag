@@ -4,12 +4,25 @@
 """Manager for shared Spanner resources (Clients and Databases) to avoid orphaned threads."""
 
 import logging
+import os
 import threading
 from typing import Any
 
+from google.auth.credentials import AnonymousCredentials
 from google.cloud import spanner
 
 logger = logging.getLogger(__name__)
+
+
+def _build_spanner_client(project_id: str, credentials: Any) -> spanner.Client:
+    """Create a Spanner client, using the local emulator if SPANNER_EMULATOR_HOST is set."""
+    emulator_host = os.environ.get("SPANNER_EMULATOR_HOST")
+    if emulator_host:
+        logger.info(
+            "Connecting to Spanner emulator at %s (project=%s)", emulator_host, project_id
+        )
+        return spanner.Client(project=project_id, credentials=AnonymousCredentials())
+    return spanner.Client(project=project_id, credentials=credentials)
 
 
 class SpannerResourceManager:
@@ -67,9 +80,7 @@ class SpannerResourceManager:
 
                 if client_key not in cls._clients:
                     logger.debug("Creating new shared Spanner Client for %s", client_key)
-                    cls._clients[client_key] = spanner.Client(
-                        project=project_id, credentials=credentials
-                    )
+                    cls._clients[client_key] = _build_spanner_client(project_id, credentials)
                     cls._client_ref_counts[client_key] = 0
 
                 cls._client_ref_counts[client_key] += 1

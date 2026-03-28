@@ -127,14 +127,9 @@ a corresponding `load_table_in_batches()` helper.
 
 ## New Features
 
-### Spanner Emulator support
+### ~~Spanner Emulator support~~ ✅ Done
 
-Detect the `SPANNER_EMULATOR_HOST` environment variable in
-`SpannerResourceManager.get_database()` and configure the client to connect to
-the emulator.  This allows unit / integration tests to run locally without real
-GCP credentials and removes the need for `@unittest.skip` guards.
-
-**Reference:** https://cloud.google.com/spanner/docs/emulator
+Implemented in `feat: Spanner Emulator support via SPANNER_EMULATOR_HOST env var` — `_build_spanner_client()` helper in `SpannerResourceManager` detects `SPANNER_EMULATOR_HOST` and automatically uses `AnonymousCredentials`.
 
 ---
 

@@ -138,3 +138,4 @@ gcloud spanner databases create <db> --instance=<name> \
 - **Azurite required**: Some unit/smoke tests fail without Azurite running.
 - **Between minor version bumps**: Run `graphrag init --root [path] --force` to get the latest config format (overwrites config + prompts — backup first).
 - **Unit tests use mocks**: GCP unit tests use `unittest.mock` — no live credentials needed. Integration tests require real GCP credentials and are skipped by default.
+- **Spanner Emulator**: Set `SPANNER_EMULATOR_HOST=localhost:9010` to redirect all Spanner connections to the local emulator. `AnonymousCredentials` are used automatically — no real GCP credentials needed.

@@ -1,6 +1,7 @@
 # Copyright (c) 2024 Microsoft Corporation.
 # Licensed under the MIT License
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 from graphrag.utils.spanner_resource_manager import SpannerResourceManager
@@ -13,6 +14,7 @@ class TestSpannerResourceManager(unittest.TestCase):
         SpannerResourceManager._client_ref_counts = {}
         SpannerResourceManager._database_ref_counts = {}
         SpannerResourceManager._db_to_client_key = {}
+        os.environ.pop("SPANNER_EMULATOR_HOST", None)
 
     # ------------------------------------------------------------------
     # _make_client_key
@@ -143,3 +145,40 @@ class TestSpannerResourceManager(unittest.TestCase):
         self.assertNotIn(mock_db2.name, SpannerResourceManager._databases)
         self.assertNotIn("p/adc", SpannerResourceManager._clients)
         mock_client.close.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Emulator support
+    # ------------------------------------------------------------------
+
+    @patch("google.cloud.spanner.Client")
+    @patch.dict(os.environ, {"SPANNER_EMULATOR_HOST": "localhost:9010"})
+    def test_emulator_uses_anonymous_credentials(self, mock_client_cls):
+        """When SPANNER_EMULATOR_HOST is set, the client must use AnonymousCredentials."""
+        mock_client = MagicMock()
+        mock_client.instance.return_value.database.return_value = MagicMock(
+            name="projects/p/instances/i/databases/d"
+        )
+        mock_client_cls.return_value = mock_client
+        mock_client.instance.return_value.database.return_value.name = "projects/p/instances/i/databases/d"
+
+        SpannerResourceManager.get_database("p", "i", "d")
+
+        call_kwargs = mock_client_cls.call_args[1]
+        from google.auth.credentials import AnonymousCredentials
+        self.assertIsInstance(call_kwargs.get("credentials"), AnonymousCredentials)
+
+    @patch("google.cloud.spanner.Client")
+    def test_no_emulator_uses_provided_credentials(self, mock_client_cls):
+        """Without SPANNER_EMULATOR_HOST, provided credentials are used."""
+        os.environ.pop("SPANNER_EMULATOR_HOST", None)
+        mock_creds = MagicMock()
+        mock_client = MagicMock()
+        mock_db = MagicMock()
+        mock_db.name = "projects/p/instances/i/databases/d"
+        mock_client.instance.return_value.database.return_value = mock_db
+        mock_client_cls.return_value = mock_client
+
+        SpannerResourceManager.get_database("p", "i", "d", credentials=mock_creds)
+
+        call_kwargs = mock_client_cls.call_args[1]
+        self.assertEqual(call_kwargs.get("credentials"), mock_creds)
