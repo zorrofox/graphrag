@@ -11,7 +11,10 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from google.api_core import exceptions
 
-from graphrag.storage.spanner_pipeline_storage import SpannerPipelineStorage
+from graphrag.storage.spanner_pipeline_storage import (
+    SpannerPipelineStorage,
+    _safe_identifier,
+)
 
 
 class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
@@ -441,6 +444,25 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
 
         self.mock_database.run_in_transaction.assert_called_once()
 
+    async def test_set_uses_parameterized_binding(self):
+        """set() must pass value_base64 as a SQL @val parameter, not inline in SQL."""
+        captured: dict = {}
+
+        def capture_transaction(func, *args, **kwargs):
+            mock_txn = MagicMock()
+            func(mock_txn)
+            captured["sql"] = mock_txn.execute_update.call_args[0][0]
+            captured["params"] = mock_txn.execute_update.call_args[1]["params"]
+
+        self.mock_database.run_in_transaction.side_effect = capture_transaction
+
+        await self.storage.set("key", b"sensitive data")
+
+        # The base64 value must be bound as @val, never embedded in the SQL string
+        self.assertIn("@val", captured["sql"])
+        self.assertIn("val", captured["params"])
+        self.assertNotIn(captured["params"]["val"], captured["sql"])
+
     # ------------------------------------------------------------------
     # set_table — retry exhaustion
     # ------------------------------------------------------------------
@@ -514,6 +536,25 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(results), 2)
 
+    def test_find_with_file_filter(self):
+        """find() should apply file_filter against named groups in the pattern."""
+        mock_snapshot = MagicMock()
+        self.mock_database.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [
+            ["2024-01-report.txt"],
+            ["2023-12-report.txt"],
+            ["2024-06-report.txt"],
+        ]
+
+        # Pattern captures the year as a named group
+        pattern = re.compile(r"(?P<year>\d{4})-\d{2}-report\.txt")
+        # Filter: only match year "2024"
+        results = list(self.storage.find(pattern, file_filter={"year": "2024"}))
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0][0], "2024-01-report.txt")
+        self.assertEqual(results[1][0], "2024-06-report.txt")
+
     def test_child_creates_prefixed_storage(self):
         """child() should return a new SpannerPipelineStorage with a stacked table prefix."""
         child = self.storage.child("reports")
@@ -568,6 +609,41 @@ class TestSpannerPipelineStorage(unittest.IsolatedAsyncioTestCase):
         result = await self.storage.get_creation_date("missing")
 
         self.assertEqual(result, "")
+
+
+class TestSafeIdentifier(unittest.TestCase):
+    """Tests for the module-level _safe_identifier() guard."""
+
+    def test_valid_simple_name(self):
+        self.assertEqual(_safe_identifier("my_table"), "`my_table`")
+
+    def test_valid_with_digits(self):
+        self.assertEqual(_safe_identifier("table_1"), "`table_1`")
+
+    def test_rejects_semicolon(self):
+        with self.assertRaises(ValueError):
+            _safe_identifier("tbl; DROP TABLE foo")
+
+    def test_rejects_space(self):
+        with self.assertRaises(ValueError):
+            _safe_identifier("my table")
+
+    def test_rejects_hyphen(self):
+        """Hyphens must be sanitized before reaching _safe_identifier."""
+        with self.assertRaises(ValueError):
+            _safe_identifier("my-table")
+
+    def test_rejects_dot(self):
+        with self.assertRaises(ValueError):
+            _safe_identifier("my.table")
+
+    def test_rejects_leading_digit(self):
+        with self.assertRaises(ValueError):
+            _safe_identifier("1table")
+
+    def test_rejects_backtick_injection(self):
+        with self.assertRaises(ValueError):
+            _safe_identifier("`injected`")
 
 
 class TestInferSpannerType(unittest.TestCase):

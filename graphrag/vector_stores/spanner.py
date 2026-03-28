@@ -5,6 +5,7 @@
 
 import json
 import logging
+import re
 from typing import Any
 
 from google.cloud import spanner
@@ -21,6 +22,22 @@ from graphrag.vector_stores.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQL-injection guard (mirrors spanner_pipeline_storage._safe_identifier)
+# ---------------------------------------------------------------------------
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_identifier(name: str) -> str:
+    """Validate and backtick-quote a Spanner identifier to prevent SQL injection."""
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe Spanner identifier {name!r}: only letters, digits, and "
+            "underscores are permitted, and the name must not start with a digit."
+        )
+    return f"`{name}`"
 
 
 class SpannerVectorStore(BaseVectorStore):
@@ -69,17 +86,23 @@ class SpannerVectorStore(BaseVectorStore):
 
     def _create_table_if_not_exists(self) -> None:
         """Create the vector store table and index if they don't exist."""
-        table_ddl = f"""CREATE TABLE IF NOT EXISTS `{self.index_name}` (
-            `{self.id_field}` STRING(MAX) NOT NULL,
-            `{self.text_field}` STRING(MAX),
-            `{self.vector_field}` ARRAY<FLOAT64>(vector_length=>{self.vector_size}),
-            `{self.attributes_field}` JSON
-        ) PRIMARY KEY (`{self.id_field}`)"""
+        _t = _safe_identifier(self.index_name)
+        _id = _safe_identifier(self.id_field)
+        _text = _safe_identifier(self.text_field)
+        _vec = _safe_identifier(self.vector_field)
+        _attrs = _safe_identifier(self.attributes_field)
 
-        index_name = f"{self.index_name}_VectorIndex"
-        index_ddl = f"""CREATE VECTOR INDEX IF NOT EXISTS `{index_name}`
-            ON `{self.index_name}`(`{self.vector_field}`)
-            WHERE `{self.vector_field}` IS NOT NULL
+        table_ddl = f"""CREATE TABLE IF NOT EXISTS {_t} (
+            {_id} STRING(MAX) NOT NULL,
+            {_text} STRING(MAX),
+            {_vec} ARRAY<FLOAT64>(vector_length=>{self.vector_size}),
+            {_attrs} JSON
+        ) PRIMARY KEY ({_id})"""
+
+        vi = _safe_identifier(f"{self.index_name}_VectorIndex")
+        index_ddl = f"""CREATE VECTOR INDEX IF NOT EXISTS {vi}
+            ON {_t}({_vec})
+            WHERE {_vec} IS NOT NULL
             OPTIONS (distance_type = 'COSINE')"""
 
         logger.info("Creating vector table and index %s if not exists...", self.index_name)
@@ -156,8 +179,14 @@ class SpannerVectorStore(BaseVectorStore):
             "k": param_types.INT64,
         }
 
+        _t = _safe_identifier(self.index_name)
+        _id = _safe_identifier(self.id_field)
+        _text = _safe_identifier(self.text_field)
+        _vec = _safe_identifier(self.vector_field)
+        _attrs = _safe_identifier(self.attributes_field)
+
         if self.query_filter:
-            where_clause = f"WHERE {self.id_field} IN UNNEST(@include_ids)"
+            where_clause = f"WHERE {_id} IN UNNEST(@include_ids)"
             params["include_ids"] = self.query_filter
             if isinstance(self.query_filter[0], int):
                 param_types_map["include_ids"] = param_types.Array(param_types.INT64)
@@ -165,9 +194,9 @@ class SpannerVectorStore(BaseVectorStore):
                 param_types_map["include_ids"] = param_types.Array(param_types.STRING)
 
         sql = f"""
-            SELECT {self.id_field}, {self.text_field}, {self.vector_field}, {self.attributes_field},
-                   COSINE_DISTANCE({self.vector_field}, @query_vector) AS distance
-            FROM {self.index_name}
+            SELECT {_id}, {_text}, {_vec}, {_attrs},
+                   COSINE_DISTANCE({_vec}, @query_vector) AS distance
+            FROM {_t}
             {where_clause}
             ORDER BY distance
             LIMIT @k
@@ -215,10 +244,16 @@ class SpannerVectorStore(BaseVectorStore):
         if isinstance(id, int):
             param_type = param_types.INT64
 
+        _t = _safe_identifier(self.index_name)
+        _id = _safe_identifier(self.id_field)
+        _text = _safe_identifier(self.text_field)
+        _vec = _safe_identifier(self.vector_field)
+        _attrs = _safe_identifier(self.attributes_field)
+
         sql = f"""
-            SELECT {self.id_field}, {self.text_field}, {self.vector_field}, {self.attributes_field}
-            FROM {self.index_name}
-            WHERE {self.id_field} = @id
+            SELECT {_id}, {_text}, {_vec}, {_attrs}
+            FROM {_t}
+            WHERE {_id} = @id
         """
 
         with self._database.snapshot() as snapshot:

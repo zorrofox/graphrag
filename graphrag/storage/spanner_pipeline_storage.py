@@ -17,10 +17,36 @@ import pandas as pd
 from google.api_core import exceptions
 from google.cloud import spanner
 
-from graphrag.storage.pipeline_storage import PipelineStorage
+from graphrag.storage.pipeline_storage import (
+    PipelineStorage,
+    get_timestamp_formatted_with_local_tz,
+)
 from graphrag.utils.spanner_resource_manager import SpannerResourceManager
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQL-injection guard
+# ---------------------------------------------------------------------------
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_identifier(name: str) -> str:
+    """Return a backtick-quoted Spanner identifier after strict validation.
+
+    Raises ValueError if *name* contains any character outside
+    ``[A-Za-z0-9_]`` or starts with a digit — the only characters that
+    Spanner allows in unquoted identifiers.  Quoting with backticks then
+    makes the result safe even if Spanner ever allows broader identifier
+    syntax in the future.
+    """
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe Spanner identifier {name!r}: only letters, digits, and "
+            "underscores are permitted, and the name must not start with a digit."
+        )
+    return f"`{name}`"
 
 
 class SpannerPipelineStorage(PipelineStorage):
@@ -287,7 +313,7 @@ class SpannerPipelineStorage(PipelineStorage):
         sanitized_name = self._sanitize_table_name(name)
         table_name = f"{self._table_prefix}{sanitized_name}"
         with self._database.snapshot() as snapshot:
-            results = snapshot.execute_sql(f"SELECT * FROM {table_name}")
+            results = snapshot.execute_sql(f"SELECT * FROM {_safe_identifier(table_name)}")
             rows = list(results)
             
             columns = []
@@ -313,8 +339,9 @@ class SpannerPipelineStorage(PipelineStorage):
         table_name = f"{self._table_prefix}{sanitized_name}"
         try:
             with self._database.snapshot() as snapshot:
-                # Use a cheap query to check existence
-                list(snapshot.execute_sql(f"SELECT 1 FROM {table_name} LIMIT 1"))
+                list(snapshot.execute_sql(
+                    f"SELECT 1 FROM {_safe_identifier(table_name)} LIMIT 1"
+                ))
             return True
         except Exception:
             return False
@@ -380,15 +407,23 @@ class SpannerPipelineStorage(PipelineStorage):
         # Use FROM_BASE64 in DML to bypass client-side type inference issues.
         value_base64 = base64.b64encode(value).decode("ascii")
 
+        safe_table = _safe_identifier(self._blob_table)
+
         def _write_blob(transaction):
-            # DEBUG: Embed base64 directly in SQL to rule out parameter binding issues.
-            # WARNING: This is vulnerable to SQL injection if value_base64 wasn't strictly base64.
-            # Since it comes from base64.b64encode, it should be safe-ish for debugging.
-            sql = f"INSERT OR UPDATE {self._blob_table} (key, value, updated_at) VALUES (@key, FROM_BASE64('{value_base64}'), PENDING_COMMIT_TIMESTAMP())"
+            # Pass value_base64 as a bound @val parameter — never interpolated
+            # into the SQL string — to eliminate the SQL-injection risk that
+            # existed when the base64 string was embedded directly in the query.
+            sql = (
+                f"INSERT OR UPDATE {safe_table} (key, value, updated_at) "
+                "VALUES (@key, FROM_BASE64(@val), PENDING_COMMIT_TIMESTAMP())"
+            )
             transaction.execute_update(
                 sql,
-                params={"key": key},
-                param_types={"key": spanner.param_types.STRING},
+                params={"key": key, "val": value_base64},
+                param_types={
+                    "key": spanner.param_types.STRING,
+                    "val": spanner.param_types.STRING,
+                },
             )
 
         try:
@@ -424,10 +459,12 @@ class SpannerPipelineStorage(PipelineStorage):
     async def clear(self) -> None:
         """Clear all blobs."""
         try:
-            self._database.execute_partitioned_dml(f"DELETE FROM {self._blob_table} WHERE true")
+            self._database.execute_partitioned_dml(
+                f"DELETE FROM {_safe_identifier(self._blob_table)} WHERE true"
+            )
         except Exception:
-             logger.exception("Error clearing Spanner blobs")
-             raise
+            logger.exception("Error clearing Spanner blobs")
+            raise
 
     def child(self, name: str | None) -> "PipelineStorage":
         """Create a child storage instance with a nested table prefix.
@@ -451,7 +488,9 @@ class SpannerPipelineStorage(PipelineStorage):
     def keys(self) -> list[str]:
         """List all blob keys."""
         with self._database.snapshot() as snapshot:
-            result = snapshot.execute_sql(f"SELECT key FROM {self._blob_table}")
+            result = snapshot.execute_sql(
+                f"SELECT key FROM {_safe_identifier(self._blob_table)}"
+            )
             return [row[0] for row in result]
 
     async def get_creation_date(self, key: str) -> str:
@@ -462,7 +501,7 @@ class SpannerPipelineStorage(PipelineStorage):
             )
             for row in result:
                 if row[0]:
-                    return str(row[0]) # Simplistic formatting
+                    return get_timestamp_formatted_with_local_tz(row[0])
             return ""
 
     def find(
@@ -470,9 +509,17 @@ class SpannerPipelineStorage(PipelineStorage):
         file_pattern: re.Pattern[str],
         base_dir: str | None = None,
         file_filter: dict[str, Any] | None = None,
-        max_count=-1,
+        max_count: int = -1,
     ) -> Iterator[tuple[str, dict[str, Any]]]:
-        """Find blobs."""
+        """Find blobs matching *file_pattern*, optionally filtered by named groups."""
+
+        def _item_filter(group: dict[str, Any]) -> bool:
+            if file_filter is None:
+                return True
+            return all(
+                re.search(value, group[key]) for key, value in file_filter.items()
+            )
+
         all_keys = self.keys()
         num_loaded = 0
         for key in all_keys:
@@ -480,7 +527,10 @@ class SpannerPipelineStorage(PipelineStorage):
             if match:
                 if base_dir and not key.startswith(base_dir):
                     continue
-                yield (key, match.groupdict())
+                group = match.groupdict()
+                if not _item_filter(group):
+                    continue
+                yield (key, group)
                 num_loaded += 1
                 if max_count > 0 and num_loaded >= max_count:
                     break
