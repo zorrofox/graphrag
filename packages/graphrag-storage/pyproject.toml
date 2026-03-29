@@ -37,6 +37,10 @@ dependencies = [
     "graphrag-common==3.0.8",
     "pandas~=2.3",
     "pydantic~=2.10",
+    # GCP optional extras (GCS + Spanner storage backends)
+    "google-cloud-storage>=2.10,<3",
+    "google-cloud-spanner>=3.40,<4",
+    "numpy~=2.1",
 ]
 
 [project.urls]

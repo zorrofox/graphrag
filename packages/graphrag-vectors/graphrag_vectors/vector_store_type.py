@@ -12,3 +12,5 @@ class VectorStoreType(StrEnum):
     LanceDB = "lancedb"
     AzureAISearch = "azure_ai_search"
     CosmosDB = "cosmosdb"
+    Spanner = "spanner"
+    VertexAI = "vertexai"

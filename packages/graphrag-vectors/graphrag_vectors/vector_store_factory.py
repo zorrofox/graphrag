@@ -87,6 +87,14 @@ def create_vector_store(
                 from graphrag_vectors.cosmosdb import CosmosDBVectorStore
 
                 register_vector_store(VectorStoreType.CosmosDB, CosmosDBVectorStore)
+            case VectorStoreType.Spanner:
+                from graphrag_vectors.spanner import SpannerVectorStore
+
+                register_vector_store(VectorStoreType.Spanner, SpannerVectorStore)
+            case VectorStoreType.VertexAI:
+                from graphrag_vectors.vertexai import VertexAIVectorStore
+
+                register_vector_store(VectorStoreType.VertexAI, VertexAIVectorStore)
             case _:
                 msg = f"Vector store type '{strategy}' is not registered in the VectorStoreFactory. Registered types: {', '.join(vector_store_factory.keys())}."
                 raise ValueError(msg)

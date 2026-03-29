@@ -14,3 +14,5 @@ class StorageType(StrEnum):
     Memory = "memory"
     AzureBlob = "blob"
     AzureCosmos = "cosmosdb"
+    GCS = "gcs"
+    Spanner = "spanner"

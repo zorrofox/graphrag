@@ -33,6 +33,9 @@ classifiers = [
 dependencies = [
     "graphrag-common==3.0.8",
     "graphrag-storage==3.0.8",
+    # GCP optional extras (GCS LiteLLM cache backend)
+    "google-cloud-storage>=2.10,<3",
+    "litellm>=1.0,<2",
 ]
 
 [project.urls]

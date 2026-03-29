@@ -71,6 +71,14 @@ def create_storage(config: StorageConfig) -> Storage:
                 from graphrag_storage.azure_cosmos_storage import AzureCosmosStorage
 
                 register_storage(StorageType.AzureCosmos, AzureCosmosStorage)
+            case StorageType.GCS:
+                from graphrag_storage.gcs_storage import GCSStorage
+
+                register_storage(StorageType.GCS, GCSStorage)
+            case StorageType.Spanner:
+                from graphrag_storage.spanner_storage import SpannerStorage
+
+                register_storage(StorageType.Spanner, SpannerStorage)
             case _:
                 msg = f"StorageConfig.type '{storage_strategy}' is not registered in the StorageFactory. Registered types: {', '.join(storage_factory.keys())}."
                 raise ValueError(msg)

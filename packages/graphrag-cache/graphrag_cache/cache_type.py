@@ -13,3 +13,4 @@ class CacheType(StrEnum):
     Json = "json"
     Memory = "memory"
     Noop = "none"
+    GCSLiteLLM = "gcs_litellm"

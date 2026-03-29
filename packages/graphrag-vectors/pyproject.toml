@@ -39,6 +39,10 @@ dependencies = [
     "numpy~=2.1",
     "pyarrow~=22.0",
     "pydantic~=2.10",
+    # GCP optional extras (Spanner + Vertex AI vector store backends)
+    "google-cloud-spanner>=3.40,<4",
+    "google-cloud-aiplatform>=1.60,<2",
+    "graphrag-storage==3.0.8",
 ]
 
 [project.urls]

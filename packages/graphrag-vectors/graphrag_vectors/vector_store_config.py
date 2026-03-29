@@ -56,3 +56,40 @@ class VectorStoreConfig(BaseModel):
     )
 
     index_schema: dict[str, IndexSchema] = {}
+
+    # Spanner-specific fields
+    project_id: str | None = Field(
+        description="The GCP project ID (used when type == spanner).",
+        default=None,
+    )
+
+    instance_id: str | None = Field(
+        description="The Spanner instance ID (used when type == spanner).",
+        default=None,
+    )
+
+    database_id: str | None = Field(
+        description="The Spanner database ID (used when type == spanner).",
+        default=None,
+    )
+
+    # Vertex AI Vector Search-specific fields
+    location: str | None = Field(
+        description="The GCP region for Vertex AI (used when type == vertexai).",
+        default=None,
+    )
+
+    index_id: str | None = Field(
+        description="The Vertex AI MatchingEngineIndex resource name or ID (used when type == vertexai).",
+        default=None,
+    )
+
+    index_endpoint_id: str | None = Field(
+        description="The Vertex AI MatchingEngineIndexEndpoint resource name or ID (used when type == vertexai).",
+        default=None,
+    )
+
+    deployed_index_id: str | None = Field(
+        description="The deployed index ID on the Vertex AI endpoint (used when type == vertexai).",
+        default=None,
+    )

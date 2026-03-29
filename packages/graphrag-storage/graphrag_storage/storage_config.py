@@ -46,3 +46,30 @@ class StorageConfig(BaseModel):
         description="The database name to use.",
         default=None,
     )
+
+    # GCS-specific fields
+    bucket_name: str | None = Field(
+        description="The GCS bucket name (used when type == gcs).",
+        default=None,
+    )
+
+    # Spanner-specific fields
+    project_id: str | None = Field(
+        description="The GCP project ID (used when type == spanner).",
+        default=None,
+    )
+
+    instance_id: str | None = Field(
+        description="The Spanner instance ID (used when type == spanner).",
+        default=None,
+    )
+
+    database_id: str | None = Field(
+        description="The Spanner database ID (used when type == spanner).",
+        default=None,
+    )
+
+    table_prefix: str | None = Field(
+        description="The table name prefix for Spanner storage (used when type == spanner).",
+        default=None,
+    )

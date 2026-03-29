@@ -79,6 +79,11 @@ def create_cache(
 
                 register_cache(CacheType.Noop, NoopCache)
 
+            case CacheType.GCSLiteLLM:
+                from graphrag_cache.gcs_litellm_cache import GCSLiteLLMCache
+
+                register_cache(CacheType.GCSLiteLLM, GCSLiteLLMCache)
+
             case _:
                 msg = f"CacheConfig.type '{cache_strategy}' is not registered in the CacheFactory. Registered types: {', '.join(cache_factory.keys())}."
                 raise ValueError(msg)
