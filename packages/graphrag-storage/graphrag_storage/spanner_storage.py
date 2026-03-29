@@ -389,6 +389,23 @@ class SpannerStorage(Storage):
 
             return pd.DataFrame(rows, columns=columns if columns else None)
 
+    def _has_table_sync(self, name: str) -> bool:
+        """Synchronous core for has_table()."""
+        sanitized_name = self._sanitize_table_name(name)
+        table_name = f"{self._table_prefix}{sanitized_name}"
+        try:
+            with self._database.snapshot() as snapshot:
+                list(snapshot.execute_sql(
+                    f"SELECT 1 FROM {_safe_identifier(table_name)} LIMIT 1"
+                ))
+            return True
+        except Exception:
+            return False
+
+    async def has_table(self, name: str) -> bool:
+        """Check if a named table exists in Spanner."""
+        return await asyncio.to_thread(self._has_table_sync, name)
+
     # ------------------------------------------------------------------
     # Blob (key/value) operations — Storage ABC implementation
     # ------------------------------------------------------------------
