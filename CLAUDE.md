@@ -167,6 +167,75 @@ gcloud spanner databases create <db> --instance=<name> \
 | `test_spanner_vector_auto_create_with_length` | Verifies `vector_length=>N` in INFORMATION_SCHEMA |
 | `test_spanner_storage_factory_integration` | create_storage() produces SpannerStorage from config |
 
+## Cloud Run Deployment
+
+End-to-end deployment scripts and configuration live in `deploy/`. See `docs/gcp_integration.md` section 13 for the full guide.
+
+### Resource Naming Convention
+
+| Resource | Recommended name pattern |
+|----------|--------------------------|
+| Cloud Run Service | `graphrag-query-service` |
+| Cloud Run Job | `graphrag-indexer` |
+| GCS buckets | `<project>-graphrag-{input,index,cache}` |
+| Spanner instance | `graphrag-instance` (Enterprise, min 100 PU) |
+| Spanner database | `graphrag-db` (GOOGLE_STANDARD_SQL dialect) |
+| Artifact Registry | `<region>-docker.pkg.dev/<project>/graphrag` |
+| Service accounts | `graphrag-query-sa`, `graphrag-indexer-sa` |
+
+### Configuration Choices
+
+- **LLM**: `gemini-3-flash-preview` via Vertex AI with `VERTEXAI_LOCATION=global`
+- **Embedding**: `text-embedding-005` via Vertex AI (768 dims)
+- **Auth**: `auth_method: azure_managed_identity` — bypasses the `api_key` requirement; LiteLLM's `vertex_ai` provider uses ADC (Cloud Run Workload Identity) automatically
+- **Cache**: `type: memory` — `GCSLiteLLMCache` is not usable here (see gotchas below)
+- **Vector store**: Spanner with auto-DDL; tables and vector indexes are created on first write
+
+### Deployment Quick Reference
+
+```bash
+# Run from the repository root
+
+# One-time infrastructure setup
+bash deploy/infra/01_setup_gcp.sh
+
+# Build and push Docker images
+bash deploy/infra/02_build_push.sh
+
+# Create indexer job and run full indexing
+bash deploy/infra/03_deploy_jobs.sh run
+
+# Deploy query service
+bash deploy/infra/04_deploy_query.sh
+
+# Enable IAP and grant user access
+bash deploy/infra/05_setup_iap.sh
+bash deploy/infra/05_setup_iap.sh grant user@your-domain.com
+
+# Trigger incremental update
+bash deploy/infra/03_deploy_jobs.sh update
+
+# Test query (from within GCP environment)
+SERVICE_URL="https://<your-cloud-run-url>"
+ID_TOKEN=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${SERVICE_URL}&format=full" -H "Metadata-Flavor: Google")
+curl -X POST "$SERVICE_URL/v1/query/global" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the main topics?"}'
+```
+
+### Cloud Run Deployment Gotchas
+
+- **`uv sync` requires `--all-packages`**: Without this flag, workspace member packages (graphrag, graphrag-storage, etc.) are not installed in the container.
+- **Escape `$` in `settings.yaml` regex**: `settings.yaml` is processed by `string.Template.substitute()`. A literal `$` in values like `file_pattern` must be written as `$$` (e.g. `".*\\.txt$$"`).
+- **Do not use uvloop**: GraphRAG uses `nest_asyncio2` internally, which cannot patch uvloop's event loop. Use plain `uvicorn` (not `uvicorn[standard]`) and do not pass `--loop uvloop`.
+- **`GCSLiteLLMCache` is not usable as the GraphRAG cache**: The factory hashes all LLM constructor arguments using `yaml.dump()` to build a singleton cache key. `GCSLiteLLMCache` holds a `google.cloud.storage.Client` which raises `PicklingError` during serialization and crashes `extract_graph`. Use `cache.type: memory` instead.
+- **`PipelineRunResult.error`** (not `.errors`): The attribute name is singular.
+- **Set `SPANNER_ENABLE_BUILT_IN_METRICS=false`**: The Spanner Python client's built-in OpenTelemetry metrics exporter emits `400 InvalidArgument` errors when resource labels are incomplete. Disabling it silences the noise entirely. Service accounts also need `roles/monitoring.metricWriter` if the exporter is left enabled.
+- **`gemini-3-flash-preview` requires `VERTEXAI_LOCATION=global`**: This model is only available on the global endpoint; setting the location to a specific region (e.g. `us-central1`) returns 404.
+- **Single uvicorn worker**: `SpannerResourceManager` uses a module-level singleton that is not multiprocess-safe. Cloud Run must run with `--workers 1`; scale horizontally via additional instances.
+- **IAP binding command**: Grant `roles/iap.httpsResourceAccessor` via `gcloud iap web add-iam-policy-binding`, not `gcloud run services add-iam-policy-binding` (the latter does not support this role on Cloud Run resources).
+
 ## Gotchas
 
 - **VectorStoreDocument**: v3 uses `data: dict[str, Any]` instead of separate `text` and `attributes` fields. Store text as `data["text"]` and retrieve with `doc.data.get("text")`.

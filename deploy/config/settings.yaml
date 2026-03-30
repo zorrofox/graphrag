@@ -1,0 +1,135 @@
+# GraphRAG v3 GCP Deployment Settings
+# Project: grhuang-02 | Region: us-central1
+#
+# Secrets and resource names are injected via Cloud Run environment variables
+# using Python string.Template substitution. No secrets are baked into this file.
+
+# ---------------------------------------------------------------------------
+# LLM: Gemini 3.0 Flash via Vertex AI (ADC / Workload Identity, no API key)
+# ---------------------------------------------------------------------------
+completion_models:
+  default_completion_model:
+    model_provider: vertex_ai
+    model: gemini-3-flash-preview
+    # auth_method: azure_managed_identity skips the api_key requirement and
+    # lets LiteLLM fall back to Application Default Credentials (ADC).
+    # Cloud Run Workload Identity provides ADC automatically.
+    auth_method: azure_managed_identity
+    call_args:
+      temperature: 0
+      max_tokens: 4096
+    rate_limit:
+      type: sliding_window
+      requests_per_period: 300
+      tokens_per_period: 1000000
+
+embedding_models:
+  default_embedding_model:
+    model_provider: vertex_ai
+    model: text-embedding-005
+    auth_method: azure_managed_identity
+    call_args:
+      task_type: RETRIEVAL_DOCUMENT
+
+concurrent_requests: 25
+async_mode: asyncio
+
+# ---------------------------------------------------------------------------
+# Input (documents read by the indexer job)
+# ---------------------------------------------------------------------------
+input:
+  type: text
+  file_pattern: ".*\\.txt$$"
+
+input_storage:
+  type: gcs
+  bucket_name: ${GCS_BUCKET_INPUT}
+  base_dir: documents
+
+# ---------------------------------------------------------------------------
+# Output (parquet index files — read by the query service at startup)
+# ---------------------------------------------------------------------------
+output_storage:
+  type: gcs
+  bucket_name: ${GCS_BUCKET_INDEX}
+  base_dir: output
+
+update_output_storage:
+  type: gcs
+  bucket_name: ${GCS_BUCKET_INDEX}
+  base_dir: update_output
+
+table_provider:
+  type: parquet
+
+# ---------------------------------------------------------------------------
+# Vector Store: Spanner (auto-creates table + COSINE_DISTANCE vector index)
+# Requires Enterprise edition Spanner, GOOGLE_STANDARD_SQL dialect
+# ---------------------------------------------------------------------------
+vector_store:
+  type: spanner
+  project_id: ${GRAPHRAG_PROJECT_ID}
+  instance_id: ${SPANNER_INSTANCE_ID}
+  database_id: ${SPANNER_DATABASE_ID}
+  vector_size: 768
+
+# ---------------------------------------------------------------------------
+# LLM Response Cache
+# memory: in-process dict, works for both indexer and query service
+# (GCSLiteLLMCache is not used because its GCS client object is not
+# YAML-serializable, which breaks GraphRAG's factory cache-key hashing)
+# ---------------------------------------------------------------------------
+cache:
+  type: memory
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+reporting:
+  type: file
+  base_dir: /tmp/graphrag-reports
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+chunking:
+  type: tokens
+  size: 1200
+  overlap: 100
+  encoding_model: o200k_base
+
+# ---------------------------------------------------------------------------
+# Graph Extraction
+# ---------------------------------------------------------------------------
+extract_graph:
+  entity_types:
+    - organization
+    - person
+    - geo
+    - event
+  max_gleanings: 1
+
+# ---------------------------------------------------------------------------
+# Community Reports
+# ---------------------------------------------------------------------------
+community_reports:
+  max_length: 2000
+  max_input_length: 8000
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+global_search:
+  max_context_tokens: 12000
+  data_max_tokens: 12000
+
+local_search:
+  max_context_tokens: 12000
+  top_k_entities: 10
+  top_k_relationships: 10
+
+drift_search:
+  max_context_tokens: 12000
+
+basic_search:
+  max_context_tokens: 12000

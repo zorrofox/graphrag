@@ -30,6 +30,14 @@
 10. [IAM 权限参考](#10-iam-权限参考)
 11. [费用与规格建议](#11-费用与规格建议)
 12. [常见问题](#12-常见问题)
+13. [Cloud Run 生产部署](#13-cloud-run-生产部署)
+    - [架构概览](#131-架构概览)
+    - [目录结构](#132-目录结构)
+    - [settings.yaml 配置](#133-settingsyaml-配置)
+    - [分步部署](#134-分步部署)
+    - [IAP 访问控制](#135-iap-访问控制)
+    - [查询 API 端点](#136-查询-api-端点)
+    - [已知限制与注意事项](#137-已知限制与注意事项)
 
 ---
 
@@ -920,3 +928,261 @@ print(json.loads(urllib.request.urlopen(req).read())['email'])
 # 重新登录 ADC
 gcloud auth application-default login
 ```
+
+---
+
+## 13. Cloud Run 生产部署
+
+本节描述将 GraphRAG v3 部署到 GCP Cloud Run 的完整方案：
+- **Cloud Run Service**：对外提供 HTTP 查询接口（global / local / drift / basic 四种搜索）
+- **Cloud Run Job**：以批处理方式运行索引构建与增量更新
+
+所有脚本和配置位于仓库 `deploy/` 目录下，所有脚本均从**仓库根目录**执行。
+
+### 13.1 架构概览
+
+```
+Client（IAP 认证）
+    │  HTTPS
+    ▼
+Cloud Run Service: graphrag-query-service
+    │  FastAPI + graphrag.api
+    │  启动时从 GCS 加载 parquet DataFrames 到内存
+    │
+    ├── GCS (<project>-graphrag-index)   ← 读取 *.parquet 索引文件
+    ├── Spanner (graphrag-db)            ← 向量相似度搜索（per-request）
+    └── Vertex AI Gemini                 ← LLM 补全
+
+Cloud Run Job: graphrag-indexer
+    ├── GCS (<project>-graphrag-input)   ← 读取原始文档
+    ├── GCS (<project>-graphrag-index)   ← 写入 parquet 索引文件
+    └── Spanner (graphrag-db)            ← 写入向量表（auto-DDL）
+```
+
+### 13.2 目录结构
+
+```
+deploy/
+├── config/
+│   └── settings.yaml          # GraphRAG 配置模板（${ENV_VAR} 占位符）
+├── query-service/
+│   ├── app/
+│   │   ├── main.py            # FastAPI 应用（4 个搜索端点 + healthz/readyz）
+│   │   └── loader.py          # 启动加载器：GCS parquet → 内存 DataFrames
+│   ├── Dockerfile
+│   └── requirements.txt       # fastapi + uvicorn（不含 uvloop，见已知限制）
+├── indexer/
+│   ├── entrypoint.py          # 调用 api.build_index()，支持增量更新
+│   └── Dockerfile
+└── infra/
+    ├── 01_setup_gcp.sh        # 一次性基础设施：GCS、Spanner、SA、IAM、Artifact Registry
+    ├── 02_build_push.sh       # Docker build + push 到 Artifact Registry
+    ├── 03_deploy_jobs.sh      # 创建/更新 Cloud Run Job；触发全量或增量运行
+    ├── 04_deploy_query.sh     # 部署 Cloud Run Service
+    └── 05_setup_iap.sh        # 启用 IAP；为用户/用户组授权
+```
+
+### 13.3 settings.yaml 配置
+
+`deploy/config/settings.yaml` 是 GraphRAG 的统一配置，所有敏感值通过 `${ENV_VAR}` 占位符在运行时注入（Python `string.Template`）。
+
+**LLM 配置（Vertex AI Gemini，无需 API key）：**
+
+```yaml
+completion_models:
+  default_completion_model:
+    model_provider: vertex_ai
+    model: gemini-3-flash-preview   # 需要 VERTEXAI_LOCATION=global
+    auth_method: azure_managed_identity  # 跳过 api_key 校验，使用 ADC/Workload Identity
+    call_args:
+      temperature: 0
+      max_tokens: 4096
+
+embedding_models:
+  default_embedding_model:
+    model_provider: vertex_ai
+    model: text-embedding-005
+    auth_method: azure_managed_identity
+```
+
+> `auth_method: azure_managed_identity` 绕过 `api_key` 必填校验。LiteLLM 的 `vertex_ai` provider 自动回退到 Application Default Credentials（ADC），由 Cloud Run Workload Identity 自动提供，无需密钥文件。
+
+**存储、表提供者、向量存储与缓存：**
+
+```yaml
+output_storage:
+  type: gcs
+  bucket_name: ${GCS_BUCKET_INDEX}
+  base_dir: output
+
+table_provider:
+  type: parquet
+
+vector_store:
+  type: spanner
+  project_id: ${GRAPHRAG_PROJECT_ID}
+  instance_id: ${SPANNER_INSTANCE_ID}
+  database_id: ${SPANNER_DATABASE_ID}
+  vector_size: 768
+
+cache:
+  type: memory   # GCSLiteLLMCache 在此场景不可用，见「已知限制」
+```
+
+**运行时环境变量：**
+
+| 变量 | 说明 |
+|------|------|
+| `GRAPHRAG_PROJECT_ID` | GCP 项目 ID |
+| `GCS_BUCKET_INPUT` | 输入文档 bucket |
+| `GCS_BUCKET_INDEX` | 索引输出 bucket（parquet 文件） |
+| `GCS_BUCKET_CACHE` | LLM 响应缓存 bucket（预留，暂不启用） |
+| `SPANNER_INSTANCE_ID` | Spanner 实例 ID |
+| `SPANNER_DATABASE_ID` | Spanner 数据库 ID |
+| `GOOGLE_CLOUD_PROJECT` | GCP 项目 ID（供 google-cloud SDK 使用） |
+| `VERTEXAI_PROJECT` | GCP 项目 ID（供 LiteLLM vertex_ai provider 使用） |
+| `VERTEXAI_LOCATION` | `global`——`gemini-3-flash-preview` 仅在 global endpoint 可用 |
+| `SPANNER_ENABLE_BUILT_IN_METRICS` | 设为 `false` 可禁用 Spanner OTEL 指标噪声 |
+
+### 13.4 分步部署
+
+```bash
+# 步骤 1：配置 gcloud
+gcloud config set project <YOUR_PROJECT_ID>
+gcloud auth application-default login
+
+# 步骤 2：一次性基础设施创建
+bash deploy/infra/01_setup_gcp.sh
+
+# 步骤 3：上传输入文档（txt 格式）
+gcloud storage cp your-docs/*.txt gs://<YOUR_PROJECT>-graphrag-input/documents/
+
+# 步骤 4：构建并推送 Docker 镜像（从仓库根目录执行）
+bash deploy/infra/02_build_push.sh
+
+# 步骤 5：创建索引 Job 并运行全量索引
+bash deploy/infra/03_deploy_jobs.sh run
+
+# 步骤 6：部署查询服务
+bash deploy/infra/04_deploy_query.sh
+
+# 步骤 7：启用 IAP 并授权用户
+bash deploy/infra/05_setup_iap.sh
+bash deploy/infra/05_setup_iap.sh grant user@your-domain.com
+
+# 增量更新（新增文档后）
+bash deploy/infra/03_deploy_jobs.sh update
+```
+
+**Docker 构建说明：**
+- 两个镜像均从仓库根目录构建，上下文包含完整的 `packages/` 目录。
+- 使用 `uv sync --all-packages --no-dev --frozen` 安装所有 workspace 包。
+- `query-service` 额外安装 `fastapi` 和 `uvicorn`（不在 workspace 依赖中）。
+
+### 13.5 IAP 访问控制
+
+**授权用户：**
+
+```bash
+# 通过部署脚本授权
+bash deploy/infra/05_setup_iap.sh grant user@your-domain.com
+bash deploy/infra/05_setup_iap.sh grant group:team@your-domain.com
+
+# 或直接使用 gcloud
+gcloud iap web add-iam-policy-binding \
+  --resource-type=cloud-run \
+  --service=graphrag-query-service \
+  --region=<REGION> \
+  --project=<PROJECT_ID> \
+  --member="user:user@your-domain.com" \
+  --role="roles/iap.httpsResourceAccessor"
+```
+
+> 必须使用 `gcloud iap web add-iam-policy-binding`，**不能**使用 `gcloud run services add-iam-policy-binding`——后者不支持在 Cloud Run 资源上绑定 `roles/iap.httpsResourceAccessor`。
+
+**命令行测试（在 GCP 环境内）：**
+
+```bash
+SERVICE_URL="https://<your-cloud-run-url>"
+
+# 从 Metadata Server 获取 ID token
+ID_TOKEN=$(curl -s \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${SERVICE_URL}&format=full" \
+  -H "Metadata-Flavor: Google")
+
+curl -X POST "$SERVICE_URL/v1/query/global" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "主要讲了什么内容？"}'
+```
+
+### 13.6 查询 API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/healthz` | GET | 存活探针，服务启动后始终返回 200 |
+| `/readyz` | GET | 就绪探针，DataFrames 加载完成后返回 200 + 索引统计；加载中返回 503 |
+| `/v1/query/global` | POST | Global search（社区报告级别，无向量查询） |
+| `/v1/query/local` | POST | Local search（实体级别 + 向量相似度） |
+| `/v1/query/drift` | POST | DRIFT search（渐进式社区精化） |
+| `/v1/query/basic` | POST | Basic RAG search（text unit 检索） |
+
+**请求体字段：**
+
+| 字段 | 类型 | 默认值 | 适用范围 |
+|------|------|--------|---------|
+| `query` | string | 必填 | 全部 |
+| `community_level` | int | `2` | global、local、drift |
+| `dynamic_community_selection` | bool | `false` | 仅 global |
+| `response_type` | string | `"Multiple Paragraphs"` | 全部 |
+
+**示例：**
+
+```bash
+# Global search
+curl -X POST "$SERVICE_URL/v1/query/global" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "主要角色有哪些？", "community_level": 2}'
+
+# Local search
+curl -X POST "$SERVICE_URL/v1/query/local" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "描述一下任务目标。"}'
+```
+
+**响应格式：**
+
+```json
+{
+  "response": "...",
+  "context_data": { "entities": [...], "reports": [...] }
+}
+```
+
+### 13.7 已知限制与注意事项
+
+#### `cache.type: memory`——GCSLiteLLMCache 不可用
+
+`Factory.create()` 在创建 LLM completion 实例时，用 `yaml.dump()` 序列化所有构造参数来生成单例缓存 key。`GCSLiteLLMCache` 内部持有 `google.cloud.storage.Client`，该对象在序列化时抛出 `PicklingError`，导致 `extract_graph` workflow 崩溃。请使用 `cache.type: memory`（进程内缓存，单次运行内有效）。
+
+#### uvloop 与 nest_asyncio2 不兼容
+
+GraphRAG 内部使用 `nest_asyncio2`，它无法 patch uvloop 的事件循环。安装 `uvicorn[standard]`（包含 uvloop）会在启动时报 `ValueError: Can't patch loop of type uvloop.Loop`。请使用不带 `[standard]` 的 `uvicorn`，不安装 uvloop，也不传 `--loop uvloop`。
+
+#### `gemini-3-flash-preview` 仅支持 `VERTEXAI_LOCATION=global`
+
+该模型只在 global endpoint 可用。将 location 设为具体区域（如 `us-central1`）会返回 404。
+
+#### Spanner OTEL 指标噪声
+
+Spanner Python 客户端内置的 OpenTelemetry 指标上报器，在 metric resource labels 不完整（缺少 `instance_id`）时会触发 `400 InvalidArgument` 错误。设置 `SPANNER_ENABLE_BUILT_IN_METRICS=false` 可完全禁用，不影响功能。如保持启用，服务账号需要 `roles/monitoring.metricWriter` 权限。
+
+#### 必须使用单 uvicorn worker
+
+`SpannerResourceManager` 使用模块级单例，不支持多进程共享。必须以 `--workers 1` 运行，通过增加 Cloud Run 实例数量横向扩展。
+
+#### `uv sync` 必须加 `--all-packages`
+
+不加此标志时，workspace 成员包（graphrag、graphrag-storage 等）不会被安装到镜像中。Dockerfile 中正确的命令是 `uv sync --all-packages --no-dev --frozen`。
