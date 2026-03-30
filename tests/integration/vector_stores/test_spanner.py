@@ -386,20 +386,19 @@ def test_create_date_components_in_data(store):
 
 
 def test_filter_by_timestamp_component(store):
-    store.insert(
+    # 用 load_documents 一次性插入两条，避免 insert() 每次都 truncate 全表
+    store.load_documents([
         VectorStoreDocument(
             id="dec",
             vector=[0.1, 0.2, 0.3, 0.4, 0.5],
             create_date="2024-12-25T10:00:00+00:00",
-        )
-    )
-    store.insert(
+        ),
         VectorStoreDocument(
             id="mar",
             vector=[0.2, 0.3, 0.4, 0.5, 0.6],
             create_date="2024-03-15T10:00:00+00:00",
-        )
-    )
+        ),
+    ])
     results = store.similarity_search_by_vector(
         [0.1, 0.2, 0.3, 0.4, 0.5], k=10, filters=F.create_date_month == 12
     )
@@ -412,24 +411,31 @@ def test_filter_by_timestamp_component(store):
 # ---------------------------------------------------------------------------
 
 def test_vector_store_factory(shared_store):
-    """create_vector_store() with type='spanner' produces a working store."""
+    """create_vector_store() with type='spanner' 产出可用的 SpannerVectorStore。
+
+    复用 shared_store 的已有表（不重建 vector index），通过 update() 验证写入能力，
+    通过 search_by_id() 验证读取能力。
+    """
     from graphrag_vectors.index_schema import IndexSchema
     from graphrag_vectors.vector_store_config import VectorStoreConfig
     from graphrag_vectors.vector_store_factory import create_vector_store
 
-    _, index_name, database = shared_store
-    factory_index = f"FactVec_{uuid4().hex[:8]}"
+    existing_store, index_name, _ = shared_store
+    cfg = _spanner_config()
+
+    # 用已有的 index_name，避免 DDL 建新 vector index
+    config = VectorStoreConfig(type="spanner", vector_size=VECTOR_SIZE, **cfg)
+    schema = IndexSchema(index_name=index_name, vector_size=VECTOR_SIZE)
+    vs = create_vector_store(config, schema)
+    vs.connect()
     try:
-        cfg = _spanner_config()
-        config = VectorStoreConfig(type="spanner", vector_size=VECTOR_SIZE, **cfg)
-        schema = IndexSchema(index_name=factory_index, vector_size=VECTOR_SIZE)
-        vs = create_vector_store(config, schema)
-        vs.connect()
-        vs.load_documents(SAMPLE_DOCS[:2])
+        # 先清空，再写入两行
+        vs._database.execute_partitioned_dml(f"DELETE FROM `{index_name}` WHERE true")
+        vs.update(VectorStoreDocument(id="f1", vector=SAMPLE_DOCS[0].vector, data={"src": "factory"}))
+        vs.update(VectorStoreDocument(id="f2", vector=SAMPLE_DOCS[1].vector, data={"src": "factory"}))
         assert vs.count() == 2
-        vs.close()
+        doc = vs.search_by_id("f1")
+        assert doc.id == "f1"
+        assert doc.data.get("src") == "factory"
     finally:
-        try:
-            database.update_ddl([f"DROP TABLE `{factory_index}`"]).result(timeout=300)
-        except Exception as e:
-            print(f"Warning: failed to drop `{factory_index}`: {e}")
+        vs.close()
