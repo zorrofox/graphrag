@@ -170,4 +170,9 @@ gcloud projects add-iam-policy-binding "${PROJECT}" \
 
 echo ""
 echo "=== Infrastructure setup complete ==="
+echo ""
+echo "  ACTION REQUIRED: Upload input documents to the correct GCS prefix:"
+echo "    gcloud storage cp <your-file.txt> gs://grhuang-02-graphrag-input/documents/"
+echo "  Files placed at the bucket root are ignored by the indexer."
+echo ""
 echo "Next step: bash deploy/infra/02_build_push.sh"
