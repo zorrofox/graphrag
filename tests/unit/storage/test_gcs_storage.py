@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import cast
 from unittest.mock import MagicMock, patch
 
-from google.api_core.exceptions import ServiceUnavailable, TooManyRequests
+from google.api_core.exceptions import NotFound, ServiceUnavailable, TooManyRequests
 from graphrag_storage.gcs_storage import GCSStorage
 
 
@@ -45,7 +45,7 @@ class TestGCSStorage(unittest.IsolatedAsyncioTestCase):
     async def test_get_non_existent_key(self):
         key = "non_existent.txt"
         mock_blob = MagicMock()
-        mock_blob.exists.return_value = False
+        mock_blob.download_as_bytes.side_effect = NotFound("not found")
         self.mock_bucket.blob.return_value = mock_blob
 
         result = await self.storage.get(key)
@@ -145,11 +145,12 @@ class TestGCSStorage(unittest.IsolatedAsyncioTestCase):
 
     async def test_delete_non_existent_key(self):
         mock_blob = MagicMock()
-        mock_blob.exists.return_value = False
+        mock_blob.delete.side_effect = NotFound("not found")
         self.mock_bucket.blob.return_value = mock_blob
 
+        # Should not raise; NotFound is silently ignored for idempotent delete.
         await self.storage.delete("ghost.txt")
-        mock_blob.delete.assert_not_called()
+        mock_blob.delete.assert_called_once()
 
     def test_keys(self):
         mock_blob1 = MagicMock()
@@ -185,7 +186,7 @@ class TestGCSStorage(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_exception_returns_none(self):
         mock_blob = MagicMock()
-        mock_blob.exists.side_effect = Exception("GCS error")
+        mock_blob.download_as_bytes.side_effect = Exception("GCS error")
         self.mock_bucket.blob.return_value = mock_blob
 
         result = await self.storage.get("key.txt")
@@ -230,16 +231,16 @@ class TestGCSStorage(unittest.IsolatedAsyncioTestCase):
         await self.storage.set(key, value)
         self.assertEqual(mock_blob.upload_from_string.call_count, 2)
 
-    def test_find_passes_max_results_to_list_blobs(self):
+    def test_find_passes_page_size_to_list_blobs(self):
         self.mock_client.list_blobs.return_value = []
         list(self.storage.find(re.compile(r".*\.txt$")))
         call_kwargs = self.mock_client.list_blobs.call_args
-        self.assertEqual(call_kwargs.kwargs.get("max_results"), 1000)
+        self.assertIsNone(call_kwargs.kwargs.get("max_results"))
         self.assertEqual(call_kwargs.kwargs.get("page_size"), 1000)
 
-    def test_keys_passes_max_results_to_list_blobs(self):
+    def test_keys_passes_page_size_to_list_blobs(self):
         self.mock_client.list_blobs.return_value = []
         self.storage.keys()
         call_kwargs = self.mock_client.list_blobs.call_args
-        self.assertEqual(call_kwargs.kwargs.get("max_results"), 1000)
+        self.assertIsNone(call_kwargs.kwargs.get("max_results"))
         self.assertEqual(call_kwargs.kwargs.get("page_size"), 1000)

@@ -13,6 +13,7 @@ directly into LiteLLM:
     litellm.cache = Cache(type="custom", cache_instance=cache)
 """
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Any
@@ -90,8 +91,6 @@ class GCSLiteLLMCache(Cache):
 
     def set_cache(self, key: str, value: Any, **kwargs: Any) -> None:
         """Synchronous set — schedules async write or runs in event loop."""
-        import asyncio
-
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -105,8 +104,6 @@ class GCSLiteLLMCache(Cache):
 
     def get_cache(self, key: str, **kwargs: Any) -> Any:
         """Synchronous get — returns None when called from a running event loop."""
-        import asyncio
-
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -143,9 +140,10 @@ class GCSLiteLLMCache(Cache):
     async def async_set_cache_pipeline(
         self, cache_list: list[Any], **kwargs: Any
     ) -> None:
-        """Store multiple key/value pairs (required by LiteLLM BaseCache ABC)."""
-        for key, value in cache_list:
-            await self.async_set_cache(key, value, **kwargs)
+        """Store multiple key/value pairs concurrently (required by LiteLLM BaseCache ABC)."""
+        await asyncio.gather(
+            *(self.async_set_cache(key, value, **kwargs) for key, value in cache_list)
+        )
 
     async def batch_cache_write(self, key: str, value: Any, **kwargs: Any) -> None:
         """Delegate to async_set_cache."""

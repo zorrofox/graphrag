@@ -18,7 +18,10 @@ import pandas as pd
 from google.api_core import exceptions
 from google.cloud import spanner
 
-from graphrag_storage.spanner_resource_manager import SpannerResourceManager
+from graphrag_storage.spanner_resource_manager import (
+    SpannerResourceManager,
+    _safe_identifier,
+)
 from graphrag_storage.storage import (
     Storage,
     get_timestamp_formatted_with_local_tz,
@@ -39,26 +42,13 @@ _DDL_TIMEOUT_SECONDS: int = 600
 _UNSAFE_TABLE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
 
 # ---------------------------------------------------------------------------
-# SQL-injection guard
-# ---------------------------------------------------------------------------
-
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-# ---------------------------------------------------------------------------
 # Schema cache size limit
 # ---------------------------------------------------------------------------
 
 _SCHEMA_CACHE_MAX_SIZE = 256
 
-
-def _safe_identifier(name: str) -> str:
-    """Return a backtick-quoted Spanner identifier after strict validation."""
-    if not _SAFE_IDENTIFIER_RE.match(name):
-        raise ValueError(
-            f"Unsafe Spanner identifier {name!r}: only letters, digits, and "
-            "underscores are permitted, and the name must not start with a digit."
-        )
-    return f"`{name}`"
+# Number of non-null values sampled when inferring a column's Spanner type.
+_INFER_SAMPLE_SIZE: int = 10
 
 
 class SpannerStorage(Storage):
@@ -139,8 +129,7 @@ class SpannerStorage(Storage):
         if len(non_null) == 0:
             return "STRING(MAX)"
 
-        SAMPLE_SIZE = 10
-        samples = non_null.head(SAMPLE_SIZE)
+        samples = non_null.head(_INFER_SAMPLE_SIZE)
 
         detected: list[str] = []
         for val in samples:
@@ -215,14 +204,7 @@ class SpannerStorage(Storage):
         self, table_name: str, df: pd.DataFrame
     ) -> None:
         """Alter a Spanner table to add missing columns."""
-        with self._database.snapshot() as snapshot:
-            results = snapshot.execute_sql(
-                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @table_name",
-                params={"table_name": table_name},
-                param_types={"table_name": spanner.param_types.STRING},
-            )
-            existing_columns = {row[0] for row in results}
-
+        existing_columns = set(self._get_table_schema(table_name).keys())
         new_columns = [col for col in df.columns if col not in existing_columns]
         if not new_columns:
             logger.warning(
@@ -399,7 +381,7 @@ class SpannerStorage(Storage):
                     f"SELECT 1 FROM {_safe_identifier(table_name)} LIMIT 1"
                 ))
             return True
-        except Exception:
+        except (exceptions.NotFound, exceptions.InvalidArgument):
             return False
 
     async def has_table(self, name: str) -> bool:

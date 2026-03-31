@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 import threading
 from typing import Any
 
@@ -13,16 +14,46 @@ from google.cloud import spanner
 
 logger = logging.getLogger(__name__)
 
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_identifier(name: str) -> str:
+    """Return a backtick-quoted Spanner identifier after strict validation."""
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe Spanner identifier {name!r}: only letters, digits, and "
+            "underscores are permitted, and the name must not start with a digit."
+        )
+    return f"`{name}`"
+
 
 def _build_spanner_client(project_id: str, credentials: Any) -> spanner.Client:
-    """Create a Spanner client, using the local emulator if SPANNER_EMULATOR_HOST is set."""
+    """Create a Spanner client, using the local emulator if SPANNER_EMULATOR_HOST is set.
+
+    Built-in Cloud Monitoring metrics are disabled unconditionally.  The
+    OpenTelemetry MeterProvider created by the Spanner SDK registers an atexit
+    handler (shutdown, timeout=30 s) that blocks process exit while it attempts
+    to flush metrics to Cloud Monitoring.  When the required resource labels are
+    incomplete the exporter raises 400 InvalidArgument on every attempt, turning
+    a clean test-suite exit into a ~30-second hang.  Callers that genuinely want
+    the metrics can override this by setting SPANNER_DISABLE_BUILTIN_METRICS=false
+    in the environment before the first Client is constructed.
+    """
     emulator_host = os.environ.get("SPANNER_EMULATOR_HOST")
     if emulator_host:
         logger.info(
             "Connecting to Spanner emulator at %s (project=%s)", emulator_host, project_id
         )
-        return spanner.Client(project=project_id, credentials=AnonymousCredentials())
-    return spanner.Client(project=project_id, credentials=credentials)
+        return spanner.Client(
+            project=project_id,
+            credentials=AnonymousCredentials(),
+            disable_builtin_metrics=True,
+        )
+    return spanner.Client(
+        project=project_id,
+        credentials=credentials,
+        disable_builtin_metrics=True,
+    )
 
 
 class SpannerResourceManager:

@@ -5,12 +5,12 @@
 
 import json
 import logging
-import re
 from typing import Any
 
 from google.api_core import exceptions
 from google.cloud import spanner
 from google.cloud.spanner_v1 import param_types
+from graphrag_storage.spanner_resource_manager import _safe_identifier
 
 from graphrag_vectors.filtering import FilterExpr
 from graphrag_vectors.vector_store import (
@@ -23,18 +23,6 @@ logger = logging.getLogger(__name__)
 
 _DDL_TIMEOUT_SECONDS: int = 600
 _VECTOR_INDEX_DDL_TIMEOUT_SECONDS: int = 900
-
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _safe_identifier(name: str) -> str:
-    """Validate and backtick-quote a Spanner identifier to prevent SQL injection."""
-    if not _SAFE_IDENTIFIER_RE.match(name):
-        raise ValueError(
-            f"Unsafe Spanner identifier {name!r}: only letters, digits, and "
-            "underscores are permitted, and the name must not start with a digit."
-        )
-    return f"`{name}`"
 
 
 class SpannerVectorStore(VectorStore):
@@ -66,6 +54,14 @@ class SpannerVectorStore(VectorStore):
         self._credentials: Any = kwargs.get("credentials")
         self._database: Any = None
 
+        # Pre-compute quoted identifiers; all fields are set by VectorStore.__init__.
+        self._q_t = _safe_identifier(self.index_name)
+        self._q_id = _safe_identifier(self.id_field)
+        self._q_vec = _safe_identifier(self.vector_field)
+        self._q_data = _safe_identifier(self.DATA_FIELD)
+        self._q_cdate = _safe_identifier(self.create_date_field)
+        self._q_udate = _safe_identifier(self.update_date_field)
+
     def connect(self) -> None:
         """Connect to the Spanner vector store."""
         # Import here to avoid circular imports and to enable lazy loading.
@@ -89,27 +85,20 @@ class SpannerVectorStore(VectorStore):
 
     def create_index(self) -> None:
         """Create the Spanner table and vector index if they don't exist."""
-        _t = _safe_identifier(self.index_name)
-        _id = _safe_identifier(self.id_field)
-        _vec = _safe_identifier(self.vector_field)
-        _cdate = _safe_identifier(self.create_date_field)
-        _udate = _safe_identifier(self.update_date_field)
-        _data = _safe_identifier(self.DATA_FIELD)
-
-        table_ddl = (
-            f"CREATE TABLE IF NOT EXISTS {_t} (\n"
-            f"    {_id} STRING(MAX) NOT NULL,\n"
-            f"    {_vec} ARRAY<FLOAT64>(vector_length=>{self.vector_size}),\n"
-            f"    {_data} JSON,\n"
-            f"    {_cdate} STRING(MAX),\n"
-            f"    {_udate} STRING(MAX)\n"
-            f") PRIMARY KEY ({_id})"
-        )
         vi = _safe_identifier(f"{self.index_name}_VectorIndex")
+        table_ddl = (
+            f"CREATE TABLE IF NOT EXISTS {self._q_t} (\n"
+            f"    {self._q_id} STRING(MAX) NOT NULL,\n"
+            f"    {self._q_vec} ARRAY<FLOAT64>(vector_length=>{self.vector_size}),\n"
+            f"    {self._q_data} JSON,\n"
+            f"    {self._q_cdate} STRING(MAX),\n"
+            f"    {self._q_udate} STRING(MAX)\n"
+            f") PRIMARY KEY ({self._q_id})"
+        )
         index_ddl = (
             f"CREATE VECTOR INDEX IF NOT EXISTS {vi}\n"
-            f"    ON {_t}({_vec})\n"
-            f"    WHERE {_vec} IS NOT NULL\n"
+            f"    ON {self._q_t}({self._q_vec})\n"
+            f"    WHERE {self._q_vec} IS NOT NULL\n"
             "    OPTIONS (distance_type = 'COSINE')"
         )
 
@@ -121,10 +110,6 @@ class SpannerVectorStore(VectorStore):
         logger.info(
             "Vector table and index %s created (or already existed).", self.index_name
         )
-
-    def _create_table_if_not_exists(self) -> None:
-        """Alias to create_index() for internal use."""
-        self.create_index()
 
     def load_documents(self, documents: list[VectorStoreDocument]) -> None:
         """Load (upsert) documents into the Spanner vector table.
@@ -155,29 +140,24 @@ class SpannerVectorStore(VectorStore):
                 doc.update_date,
             ))
 
-        safe_table = _safe_identifier(self.index_name)
-
         def _do_insert() -> None:
             with self._database.batch() as batch:
                 batch.insert_or_update(
                     table=self.index_name, columns=columns, values=rows
                 )
 
-        def _is_table_not_found(exc: Exception) -> bool:
-            return "Table not found" in str(exc)
-
         # Overwrite: truncate then insert.
         try:
             self._database.execute_partitioned_dml(
-                f"DELETE FROM {safe_table} WHERE true"
+                f"DELETE FROM {self._q_t} WHERE true"
             )
         except (exceptions.NotFound, exceptions.InvalidArgument) as e:
-            if not _is_table_not_found(e):
+            if "Table not found" not in str(e):
                 raise
             logger.info(
                 "Table %s not found on load; creating it.", self.index_name
             )
-            self._create_table_if_not_exists()
+            self.create_index()
             _do_insert()
             return
 
@@ -224,13 +204,6 @@ class SpannerVectorStore(VectorStore):
         include_vectors: bool = True,
     ) -> list[VectorStoreSearchResult]:
         """Perform ANN search by vector using Spanner COSINE_DISTANCE."""
-        _t = _safe_identifier(self.index_name)
-        _id = _safe_identifier(self.id_field)
-        _vec = _safe_identifier(self.vector_field)
-        _data = _safe_identifier(self.DATA_FIELD)
-        _cdate = _safe_identifier(self.create_date_field)
-        _udate = _safe_identifier(self.update_date_field)
-
         params: dict[str, Any] = {"query_vector": query_embedding, "k": k}
         param_types_map = {
             "query_vector": param_types.Array(param_types.FLOAT64),
@@ -238,9 +211,9 @@ class SpannerVectorStore(VectorStore):
         }
 
         sql = (
-            f"SELECT {_id}, {_vec}, {_data}, {_cdate}, {_udate},\n"
-            f"       COSINE_DISTANCE({_vec}, @query_vector) AS distance\n"
-            f"FROM {_t}\n"
+            f"SELECT {self._q_id}, {self._q_vec}, {self._q_data}, {self._q_cdate}, {self._q_udate},\n"
+            f"       COSINE_DISTANCE({self._q_vec}, @query_vector) AS distance\n"
+            f"FROM {self._q_t}\n"
             f"ORDER BY distance\n"
             f"LIMIT @k"
         )
@@ -264,20 +237,13 @@ class SpannerVectorStore(VectorStore):
         include_vectors: bool = True,
     ) -> VectorStoreDocument:
         """Search for a document by id."""
-        _t = _safe_identifier(self.index_name)
-        _id = _safe_identifier(self.id_field)
-        _vec = _safe_identifier(self.vector_field)
-        _data = _safe_identifier(self.DATA_FIELD)
-        _cdate = _safe_identifier(self.create_date_field)
-        _udate = _safe_identifier(self.update_date_field)
-
         id_param_type = (
             param_types.INT64 if isinstance(id, int) else param_types.STRING
         )
         sql = (
-            f"SELECT {_id}, {_vec}, {_data}, {_cdate}, {_udate}\n"
-            f"FROM {_t}\n"
-            f"WHERE {_id} = @id"
+            f"SELECT {self._q_id}, {self._q_vec}, {self._q_data}, {self._q_cdate}, {self._q_udate}\n"
+            f"FROM {self._q_t}\n"
+            f"WHERE {self._q_id} = @id"
         )
 
         with self._database.snapshot() as snapshot:
@@ -312,11 +278,10 @@ class SpannerVectorStore(VectorStore):
 
     def count(self) -> int:
         """Return the total number of documents in the store."""
-        _t = _safe_identifier(self.index_name)
         try:
             with self._database.snapshot() as snapshot:
                 rows = list(
-                    snapshot.execute_sql(f"SELECT COUNT(*) FROM {_t}")
+                    snapshot.execute_sql(f"SELECT COUNT(*) FROM {self._q_t}")
                 )
                 return int(rows[0][0]) if rows else 0
         except Exception:
